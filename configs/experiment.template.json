@@ -1,0 +1,49 @@
+{
+  "schema_version": "0.1",
+  "status": "planned",
+  "experiment_id": null,
+  "robot": {
+    "model": "ROBOTIS AI Worker FFW-SG2",
+    "environment": null,
+    "hardware_revision": null,
+    "software_commit": null,
+    "container_digest": null,
+    "calibration_revision": null,
+    "observation_spec": null,
+    "action_spec": null,
+    "control_hz": null
+  },
+  "task": {
+    "name": null,
+    "garment_ids": [],
+    "initial_state_manifest": null,
+    "success_criteria_revision": null,
+    "timeout_seconds": null
+  },
+  "policy": {
+    "name": null,
+    "implementation_url": null,
+    "implementation_commit": null,
+    "checkpoint_uri": null,
+    "checkpoint_sha256": null,
+    "hyperparameters_uri": null,
+    "training_seeds": []
+  },
+  "data": {
+    "dataset_uri": null,
+    "dataset_revision": null,
+    "split_manifest_uri": null,
+    "split_manifest_sha256": null
+  },
+  "evaluation": {
+    "planned_trials": null,
+    "execution_seeds": [],
+    "trial_order_manifest": null
+  },
+  "reproducibility": {
+    "repository_commit": null,
+    "worktree_dirty": null,
+    "environment_lock_uri": null,
+    "compute_hardware": null
+  }
+}

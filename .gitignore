@@ -1,0 +1,55 @@
+# Local credentials and machine-specific settings
+.env
+.env.*
+!.env.example
+secrets/
+*.pem
+*.key
+*.local.json
+*.local.yaml
+*.local.yml
+
+# Python and editors
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+.ipynb_checkpoints/
+.idea/
+.vscode/
+.DS_Store
+
+# Datasets, generated outputs, videos, and model weights
+/data/
+/datasets/
+/checkpoints/
+/videos/
+/outputs/
+/runs/
+/wandb/
+/third_party/
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.onnx
+*.bag
+*.mcap
+*.db3
+*.h5
+*.hdf5
+*.parquet
+*.mp4
+*.mov
+*.avi
+*.webm
+
+# ROS / build outputs
+/build/
+/install/
+/log/
+/dist/

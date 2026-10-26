@@ -1,0 +1,6 @@
+[submodule "models/openpi/upstream"]
+	path = models/openpi/upstream
+	url = https://github.com/jaehoondata/openpi.git
+[submodule "models/molmoact2/upstream"]
+	path = models/molmoact2/upstream
+	url = https://github.com/jaehoondata/molmoact2.git
