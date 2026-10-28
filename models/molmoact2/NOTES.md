@@ -2,8 +2,17 @@
 
 - Fork: https://github.com/jaehoondata/molmoact2
 - Upstream: https://github.com/allenai/molmoact2
-- Code: `upstream/` (submodule)
-- Custom scripts: `scripts/`, task configs: `configs/`
+- `upstream/` (submodule): 참고용. 공식 실험 스크립트·FastAPI 서버 확인
+- 학습은 LeRobot 0.6.1의 `policy.type=molmoact2`로 한다 (`scripts/train.sh`).
+
+## Training
+
+```bash
+DATASET_REPO=jaehoondata/laundry_fold_eef DATASET_REV=v0.1 bash models/molmoact2/scripts/train.sh
+```
+
+- 기본값: `allenai/MolmoAct2-BimanualYAM`에서 시작, VLM LoRA + action expert 전체 학습, bs=16 (H100 기준 ~27GiB).
+- `SETUP_TYPE`(프롬프트에 들어가는 장면 설명)은 아직 임시 문구.
 
 ## Clone note
 
