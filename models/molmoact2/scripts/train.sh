@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # MolmoAct2 fine-tuning with LeRobot 0.6.1 (policy.type=molmoact2), run in a tmux session.
 #
-#   DATASET_REPO=jaehoondata/laundry_fold_eef DATASET_REV=v0.1 \
+#   DATASET_REPO=jaehoon2da/laundry_fold_tshirt_arm16 DATASET_REV=v0.1 \
 #       bash models/molmoact2/scripts/train.sh [extra lerobot-train args...]
 #
 # Defaults follow the LeRobot MolmoAct2 docs for <200 real-world demos: LoRA on the VLM
@@ -9,9 +9,13 @@
 # Starts from MolmoAct2-BimanualYAM (bimanual, absolute joint pose) instead of the base.
 # normalize_gripper=true: SG2 gripper joints span 0..1.1 rad, outside the [-1, 1] passthrough
 # range MolmoAct2 assumes for un-normalized gripper dims.
+#
+# Measured on the RTX 6000 Ada (bs=16): ~10.4 s/step with these defaults, ~5.2 s/step with
+# action-expert-only training (--policy.action_mode=continuous --policy.enable_lora_vlm=false
+# --policy.train_action_expert_only=true).
 set -euo pipefail
 
-: "${DATASET_REPO:?set DATASET_REPO, e.g. jaehoondata/laundry_fold_eef}"
+: "${DATASET_REPO:?set DATASET_REPO, e.g. jaehoon2da/laundry_fold_tshirt_arm16}"
 : "${DATASET_REV:?set DATASET_REV, e.g. v0.1}"
 CHECKPOINT="${CHECKPOINT:-allenai/MolmoAct2-BimanualYAM}"
 # TODO: 실제 장면 설명으로 다듬기. 예시는 allenai/MolmoAct2 norm_stats.json의 metadata_by_tag 참고
@@ -25,8 +29,10 @@ JOB_NAME="${JOB_NAME:-molmoact2_$(basename "$DATASET_REPO")_${DATASET_REV}_$(dat
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 OUTPUT_DIR="$REPO_ROOT/outputs/$JOB_NAME"
 
+# python -m rather than the accelerate script: a user-site ~/.local/bin/accelerate (system
+# Python, no torch) can come before the conda env in PATH.
 "$REPO_ROOT/tools/tmux_run.sh" "$JOB_NAME" "$REPO_ROOT/outputs/logs" \
-    accelerate launch --num_processes=1 --mixed_precision=bf16 \
+    python -m accelerate.commands.launch --num_processes=1 --mixed_precision=bf16 \
     -m lerobot.scripts.lerobot_train \
     --dataset.repo_id="$DATASET_REPO" \
     --dataset.revision="$DATASET_REV" \

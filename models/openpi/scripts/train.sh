@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # pi0.5 fine-tuning with LeRobot 0.6.1 (policy.type=pi05), run in a tmux session.
 #
-#   DATASET_REPO=jaehoondata/laundry_fold_eef DATASET_REV=v0.1 \
+#   DATASET_REPO=jaehoon2da/laundry_fold_tshirt_arm16 DATASET_REV=v0.1 \
 #       bash models/openpi/scripts/train.sh [extra lerobot-train args...]
 #
 # Defaults target one A6000 Ada (48GB): the LeRobot docs size full fine-tuning for
@@ -9,7 +9,7 @@
 # Set TRAIN_EXPERT_ONLY=false to try full fine-tuning (lower BATCH first).
 set -euo pipefail
 
-: "${DATASET_REPO:?set DATASET_REPO, e.g. jaehoondata/laundry_fold_eef}"
+: "${DATASET_REPO:?set DATASET_REPO, e.g. jaehoon2da/laundry_fold_tshirt_arm16}"
 : "${DATASET_REV:?set DATASET_REV, e.g. v0.1}"
 PRETRAINED="${PRETRAINED:-lerobot/pi05_base}"
 TRAIN_EXPERT_ONLY="${TRAIN_EXPERT_ONLY:-true}"

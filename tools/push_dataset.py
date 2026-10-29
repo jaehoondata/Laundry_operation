@@ -1,10 +1,10 @@
 """Upload a finalized VAI_AIWORKER dataset to a private Hugging Face Hub repo and tag it.
 
 Run on the Mac (VAI_AIWORKER's ri_motion_v5_py312 env already has lerobot 0.6.1),
-after review_dataset.ipynb has produced the `*_final` dataset:
+after review_dataset.ipynb and tools/select_joints.py have produced the `*_final_arm16` dataset:
 
-    python tools/push_dataset.py ~/aiworker_data/"laundry fold_eef_final" \
-        --repo-id jaehoondata/laundry_fold_eef --tag v0.1
+    python tools/push_dataset.py ~/aiworker_data/laundry_fold_tshirt_eef_final_arm16 \
+        --repo-id jaehoon2da/laundry_fold_tshirt_arm16 --tag v0.1
 
 Training then pins the exact data with --dataset.repo_id / --dataset.revision=<tag>.
 The recorder writes with repo_id="local/...", so the Hub repo_id is given here instead.
@@ -19,7 +19,7 @@ from lerobot.datasets.lerobot_dataset import LeRobotDataset
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("root", type=Path, help="finalized LeRobot v3.0 dataset root (has meta/info.json)")
-    parser.add_argument("--repo-id", required=True, help="e.g. jaehoondata/laundry_fold_eef")
+    parser.add_argument("--repo-id", required=True, help="e.g. jaehoon2da/laundry_fold_tshirt_arm16")
     parser.add_argument("--tag", required=True, help="dataset version tag, e.g. v0.1")
     parser.add_argument("--public", action="store_true", help="create a public repo (default: private)")
     args = parser.parse_args()

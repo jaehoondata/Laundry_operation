@@ -8,7 +8,7 @@
 ## Training
 
 ```bash
-DATASET_REPO=jaehoondata/laundry_fold_eef DATASET_REV=v0.1 bash models/openpi/scripts/train.sh
+DATASET_REPO=jaehoon2da/laundry_fold_tshirt_arm16 DATASET_REV=v0.1 bash models/openpi/scripts/train.sh
 ```
 
 - 기본값은 A6000 Ada 48GB 기준 action expert만 학습 (`TRAIN_EXPERT_ONLY=true`). LeRobot 문서의 전체 fine-tuning 예시는 80GB GPU 기준.

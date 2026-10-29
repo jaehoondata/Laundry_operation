@@ -8,7 +8,9 @@
 # train.sh calls can be queued back to back inside one outer tmux session.
 set -euo pipefail
 
-SESSION="$1"; LOG_DIR="$2"; shift 2
+# tmux rejects '.' and ':' in session names, and train.sh's default JOB_NAME contains
+# DATASET_REV (e.g. v0.1).
+SESSION="${1//[.:]/_}"; LOG_DIR="$2"; shift 2
 if [[ "${TMUX_RUN_INLINE:-0}" == 1 ]]; then
     mkdir -p "$LOG_DIR"
     "$@" 2>&1 | tee -a "$LOG_DIR/$SESSION.log"

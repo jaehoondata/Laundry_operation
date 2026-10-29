@@ -8,7 +8,7 @@
 ## Training
 
 ```bash
-DATASET_REPO=jaehoondata/laundry_fold_eef DATASET_REV=v0.1 bash models/molmoact2/scripts/train.sh
+DATASET_REPO=jaehoon2da/laundry_fold_tshirt_arm16 DATASET_REV=v0.1 bash models/molmoact2/scripts/train.sh
 ```
 
 - 기본값: `allenai/MolmoAct2-BimanualYAM`에서 시작, VLM LoRA + action expert 전체 학습, bs=16 (H100 기준 ~27GiB).

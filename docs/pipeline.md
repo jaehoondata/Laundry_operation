@@ -5,7 +5,7 @@
 | 수집 | Mac (로봇 LAN) | VAI_AIWORKER `real_vr_teleop_record.ipynb` → `~/aiworker_data/<task>` (LeRobot v3.0, 30Hz) |
 | 검수 | Mac | VAI_AIWORKER `review_dataset.ipynb` → `<task>_final` |
 | 관절 선택 | Mac | `python tools/select_joints.py <task>_final <task>_final_arm16` — lift·head 제외, 16 joints |
-| 업로드 | Mac | `python tools/push_dataset.py <task>_final_arm16 --repo-id jaehoondata/<name> --tag vX.Y` (private) |
+| 업로드 | Mac | `python tools/push_dataset.py <task>_final_arm16 --repo-id jaehoon2da/<name> --tag vX.Y` (private) |
 | 학습 | Ubuntu (A6000 Ada) | `models/<model>/scripts/train.sh` — LeRobot 0.6.1, tmux 세션, wandb |
 | 추론 | Ubuntu (로봇 LAN) | VAI_AIWORKER `real_policy_inference.ipynb`, `CHECKPOINT_PATH=outputs/<job>/checkpoints/<step>/pretrained_model`, `EXCLUDED_JOINTS = ["lift_joint", "head_joint1", "head_joint2"]` |
 
