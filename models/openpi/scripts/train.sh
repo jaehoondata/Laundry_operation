@@ -2,7 +2,7 @@
 # pi0.5 fine-tuning with LeRobot 0.6.1 (policy.type=pi05), run in a tmux session.
 #
 #   DATASET_REPO=jaehoondata/laundry_fold_eef DATASET_REV=v0.1 \
-#       bash models/openpi/scripts/train.sh
+#       bash models/openpi/scripts/train.sh [extra lerobot-train args...]
 #
 # Defaults target one A6000 Ada (48GB): the LeRobot docs size full fine-tuning for
 # an 80GB GPU, so this starts with the VLM frozen (action expert only).
@@ -32,6 +32,7 @@ OUTPUT_DIR="$REPO_ROOT/outputs/$JOB_NAME"
     --policy.freeze_vision_encoder="$TRAIN_EXPERT_ONLY" \
     --policy.gradient_checkpointing=true \
     --policy.dtype=bfloat16 \
+    --policy.scheduler_decay_steps="$STEPS" \
     --policy.device=cuda \
     --policy.push_to_hub=false \
     --output_dir="$OUTPUT_DIR" \
@@ -41,4 +42,5 @@ OUTPUT_DIR="$REPO_ROOT/outputs/$JOB_NAME"
     --steps="$STEPS" \
     --save_freq="$SAVE_FREQ" \
     --wandb.enable=true \
-    --wandb.project=laundry_operation
+    --wandb.project=laundry_operation \
+    "$@"

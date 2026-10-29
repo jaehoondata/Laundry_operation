@@ -2,11 +2,13 @@
 # MolmoAct2 fine-tuning with LeRobot 0.6.1 (policy.type=molmoact2), run in a tmux session.
 #
 #   DATASET_REPO=jaehoondata/laundry_fold_eef DATASET_REV=v0.1 \
-#       bash models/molmoact2/scripts/train.sh
+#       bash models/molmoact2/scripts/train.sh [extra lerobot-train args...]
 #
 # Defaults follow the LeRobot MolmoAct2 docs for <200 real-world demos: LoRA on the VLM
 # with the action expert fully trainable (~27GiB at bs=16 on H100, fits a 48GB A6000 Ada).
 # Starts from MolmoAct2-BimanualYAM (bimanual, absolute joint pose) instead of the base.
+# normalize_gripper=true: SG2 gripper joints span 0..1.1 rad, outside the [-1, 1] passthrough
+# range MolmoAct2 assumes for un-normalized gripper dims.
 set -euo pipefail
 
 : "${DATASET_REPO:?set DATASET_REPO, e.g. jaehoondata/laundry_fold_eef}"
@@ -34,6 +36,7 @@ OUTPUT_DIR="$REPO_ROOT/outputs/$JOB_NAME"
     --policy.checkpoint_path="$CHECKPOINT" \
     --policy.device=cuda \
     --policy.action_mode=both \
+    --policy.inference_action_mode=continuous \
     --policy.enable_lora_vlm=true \
     --policy.chunk_size="$CHUNK" \
     --policy.n_action_steps="$CHUNK" \
@@ -43,6 +46,8 @@ OUTPUT_DIR="$REPO_ROOT/outputs/$JOB_NAME"
     --policy.model_dtype=bfloat16 \
     --policy.num_flow_timesteps=8 \
     --policy.gradient_checkpointing=true \
+    --policy.normalize_gripper=true \
+    --policy.scheduler_decay_steps="$STEPS" \
     --policy.push_to_hub=false \
     --output_dir="$OUTPUT_DIR" \
     --job_name="$JOB_NAME" \
@@ -52,4 +57,5 @@ OUTPUT_DIR="$REPO_ROOT/outputs/$JOB_NAME"
     --save_freq="$SAVE_FREQ" \
     --env_eval_freq=-1 \
     --wandb.enable=true \
-    --wandb.project=laundry_operation
+    --wandb.project=laundry_operation \
+    "$@"
