@@ -122,7 +122,7 @@ def main():
     p.add_argument("--mesh-id", type=int, default=0)
     p.add_argument("--cache", type=Path, default=Path("outputs/style3d_gate/cache"))
     p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--sim-dt", type=float, default=8e-4)
+    p.add_argument("--sim-dt", type=float, default=2e-3)
     p.add_argument("--iterations", type=int, default=10)
     p.add_argument("--linear-iterations", type=int, default=10)
     p.add_argument("--collide-every", type=int, default=6, help="substeps per block (even)")

@@ -211,6 +211,7 @@ class ClothSim:
         self.pipeline = newton.CollisionPipeline(self.model)
         self.contacts = self.pipeline.contacts()
 
+        self.rest = verts  # rest shape (before pos/rot), same vertex order as the model
         self.mass_free = self.model.particle_mass.numpy().copy()
         self.n_sub = 0
         self.t = 0.0
@@ -228,11 +229,18 @@ class ClothSim:
     def qd(self) -> np.ndarray:
         return self.state_0.particle_qd.numpy().astype(np.float64)
 
-    def grasp(self, picker_pos: np.ndarray, must_include: list[int]):
-        """Pin vertices inside each picker box (approach = -z world) to that picker."""
+    def grasp(self, picker_pos: np.ndarray, must_include: list[int]) -> dict:
+        """Pin vertices inside each picker box (approach = -z world) to that picker.
+
+        Vertices farther than --grasp-rest-radius from the anchor in the rest shape are left
+        free: otherwise a picker over a crumpled spot clamps distant cloth regions together and
+        spreading the pickers stretches the cloth between them.
+        """
         q = self.q()
         idx, off, own = [], [], []
+        info = {"pinned": [], "dropped_far": [], "manipulable": []}
         for k, p in enumerate(picker_pos):
+            anchor = must_include[k]
             d = q - p
             # EEF z points down, so EEF z in [lo, hi] maps to world dz in [-hi, -lo]
             inside = (
@@ -241,11 +249,17 @@ class ClothSim:
                 & (d[:, 2] >= -PICKER_BOX[2, 1])
                 & (d[:, 2] <= -PICKER_BOX[2, 0])
             )
-            sel = set(np.nonzero(inside)[0].tolist()) | {must_include[k]}
-            sel -= set(idx)
+            rest_d = np.linalg.norm(self.rest - self.rest[anchor], axis=1)
+            near = rest_d <= self.args.grasp_rest_radius
+            sel = (set(np.nonzero(inside & near)[0].tolist()) | {anchor}) - set(idx)
             idx += sorted(sel)
             off += [q[i] - p for i in sorted(sel)]
             own += [k] * len(sel)
+            # FoldNet++ affordance: vertices within 2 cm now must lie within 8 cm in the rest shape
+            around = np.linalg.norm(q - q[anchor], axis=1) <= 0.02
+            info["pinned"].append(len(sel))
+            info["dropped_far"].append(int((inside & ~near).sum()))
+            info["manipulable"].append(bool((rest_d[around] <= 0.08).all()))
         # Pin by making the vertices very heavy rather than inactive: Style3D's collision kernels
         # take a harmonic mean of per-vertex diagonals, which is 0/0 = NaN when two inactive
         # vertices touch (e.g. two cloth layers inside one picker box).
@@ -261,7 +275,7 @@ class ClothSim:
         self.cur_targets = picker_pos.copy()
         self.targets.assign(picker_pos)  # settle() holds the pickers here without calling follow()
         self.target_vel.zero_()
-        return len(idx)
+        return info
 
     def release(self):
         if self.pinned is not None:
@@ -416,7 +430,9 @@ def run_episode(args, sim: ClothSim, flat_test: bool, top, verts, keypoints, che
             if q[ia, 0] > q[ib, 0]:
                 ia, ib = ib, ia
             ga, gb = q[ia].copy(), q[ib].copy()
-            n_pin = sim.grasp(np.stack([ga, gb]), [ia, ib])
+            grasp_info = sim.grasp(np.stack([ga, gb]), [ia, ib])
+            print(f"  [trial {log['trial']}] fling{f} grasp {ka}/{kb}: pinned={grasp_info['pinned']} "
+                  f"dropped_far={grasp_info['dropped_far']} manipulable={grasp_info['manipulable']}", flush=True)
             log["last_pinned"] = sim.pinned[0].numpy().tolist()
             rest_d = np.linalg.norm(verts[keypoints[ka][0]] - verts[keypoints[kb][0]])
             d = min(args.stretch_ratio * rest_d, args.max_spread)
@@ -433,7 +449,7 @@ def run_episode(args, sim: ClothSim, flat_test: bool, top, verts, keypoints, che
             sim.release()
             sim.settle(args.release_settle, f"fling{f}_settle")
             e = checkpoint(f"fling{f}_done")
-            e.update({"pair": [ka, kb], "pinned_vertices": n_pin})
+            e.update({"pair": [ka, kb], **grasp_info})
 
 
 def verdict(log: dict) -> tuple[list[str], list[str]]:
@@ -506,7 +522,8 @@ def main():
     p.add_argument("--no-video", action="store_true")
     p.add_argument("--quick", action="store_true", help="short CPU smoke test (coarse dt, short phases)")
     # solver
-    p.add_argument("--sim-dt", type=float, default=8e-4, help="FoldNet++ dt_cloth")
+    p.add_argument("--sim-dt", type=float, default=2e-3,
+                   help="FoldNet++ uses 8e-4; 2e-3 gave the same strain/coverage at 2.5x speed")
     p.add_argument("--iterations", type=int, default=10)
     p.add_argument("--linear-iterations", type=int, default=10)
     p.add_argument("--collide-every", type=int, default=5, help="substeps between table contact queries")
@@ -522,6 +539,8 @@ def main():
     p.add_argument("--table-kd", type=float, default=1e-5)
     p.add_argument("--contact-radius", type=float, default=3e-3)
     p.add_argument("--pin-mass-factor", type=float, default=1e4, help="pinned vertex mass / max cloth vertex mass")
+    p.add_argument("--grasp-rest-radius", type=float, default=0.08,
+                   help="only pin vertices within this rest-shape distance of the grasp anchor (FoldNet++ 8 cm)")
     # episode
     p.add_argument("--hang-z", type=float, default=0.6)
     p.add_argument("--hang-time", type=float, default=1.0)
@@ -533,7 +552,8 @@ def main():
     p.add_argument("--max-spread", type=float, default=0.7)
     p.add_argument("--fling-y1", type=float, default=-0.2)
     p.add_argument("--fling-y2", type=float, default=0.25)
-    p.add_argument("--fling-z2", type=float, default=0.02)
+    p.add_argument("--fling-z2", type=float, default=0.04,
+                   help="fling end height; at 0.02 the pinned cloth pressed through the pile below")
     args = p.parse_args()
 
     if args.quick:
