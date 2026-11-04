@@ -18,6 +18,13 @@ else
     conda activate "$ENV_NAME"
 fi
 
+# PyPI warp-lang is built with CUDA 13 (needs driver >= 580); the lab PC has 570, so use the cu12 build.
+if ! python -c "import warp as wp; wp.config.quiet = True; wp.init(); assert wp.is_cuda_available()" 2>/dev/null; then
+    WARP_VER=$(python -c "import importlib.metadata as m; print(m.version('warp-lang').split('+')[0])")
+    pip install --force-reinstall --no-deps \
+        "https://github.com/NVIDIA/warp/releases/download/v${WARP_VER}/warp_lang-${WARP_VER}%2Bcu12-py3-none-manylinux_2_28_x86_64.whl"
+fi
+
 while true; do
     used=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits | head -1)
     [ "$used" -lt "$MAX_USED_MIB" ] && break

@@ -166,6 +166,12 @@ def drive_pinned(
     qd[p] = target_vel[owner[i]]
 
 
+class Diverged(RuntimeError):
+    def __init__(self, t: float, phase: str, bad_idx: np.ndarray):
+        super().__init__(f"NaN at t={t:.2f}s in {phase} ({len(bad_idx)} vertices)")
+        self.t, self.phase, self.bad_idx = t, phase, bad_idx
+
+
 class ClothSim:
     def __init__(self, args, verts, faces, panel, panel_idx, pos, rot):
         self.args = args
@@ -205,7 +211,7 @@ class ClothSim:
         self.pipeline = newton.CollisionPipeline(self.model)
         self.contacts = self.pipeline.contacts()
 
-        self.flags_active = self.model.particle_flags.numpy().copy()
+        self.mass_free = self.model.particle_mass.numpy().copy()
         self.n_sub = 0
         self.t = 0.0
         self.pinned = None  # (idx, offset, owner) as warp arrays
@@ -240,9 +246,12 @@ class ClothSim:
             idx += sorted(sel)
             off += [q[i] - p for i in sorted(sel)]
             own += [k] * len(sel)
-        flags = self.flags_active.copy()
-        flags[idx] &= ~int(newton.ParticleFlags.ACTIVE)
-        self.model.particle_flags.assign(flags)
+        # Pin by making the vertices very heavy rather than inactive: Style3D's collision kernels
+        # take a harmonic mean of per-vertex diagonals, which is 0/0 = NaN when two inactive
+        # vertices touch (e.g. two cloth layers inside one picker box).
+        mass = self.mass_free.copy()
+        mass[idx] = self.mass_free.max() * self.args.pin_mass_factor
+        self.model.particle_mass.assign(mass)
         dev = self.args.device
         self.pinned = (
             wp.array(np.array(idx, dtype=np.int32), dtype=int, device=dev),
@@ -250,12 +259,14 @@ class ClothSim:
             wp.array(np.array(own, dtype=np.int32), dtype=int, device=dev),
         )
         self.cur_targets = picker_pos.copy()
+        self.targets.assign(picker_pos)  # settle() holds the pickers here without calling follow()
+        self.target_vel.zero_()
         return len(idx)
 
     def release(self):
         if self.pinned is not None:
             self._drive(self.state_0)  # hand the picker velocity to the freed vertices
-        self.model.particle_flags.assign(self.flags_active)
+        self.model.particle_mass.assign(self.mass_free)
         self.pinned = None
         self.target_vel.zero_()
 
@@ -266,7 +277,10 @@ class ClothSim:
 
     def _record(self):
         if self.t + 1e-9 >= self.next_record:
-            self.frames.append(self.state_0.particle_q.numpy().copy())
+            q = self.state_0.particle_q.numpy().copy()
+            if not np.isfinite(q).all():
+                raise Diverged(self.t, self.phase, np.nonzero(~np.isfinite(q).all(1))[0])
+            self.frames.append(q)
             self.frame_t.append(self.t)
             self.frame_phase.append(self.phase)
             self.frame_pickers.append(self.cur_targets.copy() if self.pinned is not None else np.full((2, 3), np.nan))
@@ -355,6 +369,31 @@ def run_trial(args, trial: int, verts0, faces, keypoints, out_dir: Path) -> dict
               f"vmax={entry['max_speed']:.2f} wall={entry['wall_s']:.0f}s", flush=True)
         return entry
 
+    try:
+        run_episode(args, sim, flat_test, top if not flat_test else None, verts, keypoints, checkpoint, log)
+    except Diverged as e:
+        print(f"  [trial {trial}] DIVERGED: {e}", flush=True)
+        pinned = set(log.get("last_pinned", []))
+        log["diverged"] = {"t": e.t, "phase": e.phase, "n_bad": len(e.bad_idx),
+                           "bad_idx_sample": e.bad_idx[:50].tolist(),
+                           "bad_in_pinned": len(pinned & set(e.bad_idx.tolist()))}
+
+    sim_time = sim.t
+    log["sim_time_s"] = sim_time
+    log["wall_time_s"] = time.time() - t_wall
+    log["realtime_factor"] = sim_time / log["wall_time_s"]
+
+    trial_dir = out_dir / f"trial_{trial:02d}"
+    trial_dir.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(trial_dir / "frames.npz", q=np.stack(sim.frames).astype(np.float32), faces=faces,
+                        t=np.array(sim.frame_t), phase=np.array(sim.frame_phase),
+                        pickers=np.stack(sim.frame_pickers).astype(np.float32))
+    if not args.no_video:
+        render_video(trial_dir / "video.mp4", sim, faces, 1.0 / args.record_dt)
+    return log
+
+
+def run_episode(args, sim: ClothSim, flat_test: bool, top, verts, keypoints, checkpoint, log):
     if flat_test:
         sim.settle(args.flat_settle, "flat_settle")
         checkpoint("flat_settle")
@@ -378,6 +417,7 @@ def run_trial(args, trial: int, verts0, faces, keypoints, out_dir: Path) -> dict
                 ia, ib = ib, ia
             ga, gb = q[ia].copy(), q[ib].copy()
             n_pin = sim.grasp(np.stack([ga, gb]), [ia, ib])
+            log["last_pinned"] = sim.pinned[0].numpy().tolist()
             rest_d = np.linalg.norm(verts[keypoints[ka][0]] - verts[keypoints[kb][0]])
             d = min(args.stretch_ratio * rest_d, args.max_spread)
             z1 = args.lift_z
@@ -395,24 +435,14 @@ def run_trial(args, trial: int, verts0, faces, keypoints, out_dir: Path) -> dict
             e = checkpoint(f"fling{f}_done")
             e.update({"pair": [ka, kb], "pinned_vertices": n_pin})
 
-    sim_time = sim.t
-    log["sim_time_s"] = sim_time
-    log["wall_time_s"] = time.time() - t_wall
-    log["realtime_factor"] = sim_time / log["wall_time_s"]
-
-    trial_dir = out_dir / f"trial_{trial:02d}"
-    trial_dir.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(trial_dir / "frames.npz", q=np.stack(sim.frames).astype(np.float32), faces=faces,
-                        t=np.array(sim.frame_t), phase=np.array(sim.frame_phase),
-                        pickers=np.stack(sim.frame_pickers).astype(np.float32))
-    if not args.no_video:
-        render_video(trial_dir / "video.mp4", sim, faces, 1.0 / args.record_dt)
-    return log
-
 
 def verdict(log: dict) -> tuple[list[str], list[str]]:
     """FAIL = solver stability (what this gate is about); WARN = fling effectiveness (tunable)."""
     fails, warns = [], []
+    if "diverged" in log:
+        d = log["diverged"]
+        fails.append(f"diverged at t={d['t']:.2f}s in {d['phase']} ({d['n_bad']} NaN vertices)")
+        return fails, warns
     for p in log["phases"]:
         if p["nan"]:
             fails.append(f"{p['name']}: NaN")
@@ -491,6 +521,7 @@ def main():
     p.add_argument("--table-ke", type=float, default=1e1)
     p.add_argument("--table-kd", type=float, default=1e-5)
     p.add_argument("--contact-radius", type=float, default=3e-3)
+    p.add_argument("--pin-mass-factor", type=float, default=1e4, help="pinned vertex mass / max cloth vertex mass")
     # episode
     p.add_argument("--hang-z", type=float, default=0.6)
     p.add_argument("--hang-time", type=float, default=1.0)
@@ -511,6 +542,8 @@ def main():
         args.trials, args.flings, args.record_dt = min(args.trials, 2), 1, 0.2
 
     wp.init()
+    if args.device.startswith("cuda") and not wp.is_cuda_available():
+        raise SystemExit("Warp sees no CUDA device; check the Warp init message above (driver vs. wheel CUDA version).")
     mesh_dir = fetch_mesh(args.mesh_id, args.cache)
     verts, faces = load_obj(mesh_dir / "mesh.obj")
     keypoints = json.loads((mesh_dir / "mesh_info.json").read_text())["triangulation"]["keypoint_idx"]
