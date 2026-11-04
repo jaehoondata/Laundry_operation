@@ -230,7 +230,7 @@ class ClothSim:
         return self.state_0.particle_qd.numpy().astype(np.float64)
 
     def grasp(self, picker_pos: np.ndarray, must_include: list[int]) -> dict:
-        """Pin vertices inside each picker box (approach = -z world) to that picker.
+        """Pin vertices inside each picker box (top-down grasp) to that picker.
 
         Vertices farther than --grasp-rest-radius from the anchor in the rest shape are left
         free: otherwise a picker over a crumpled spot clamps distant cloth regions together and
@@ -242,12 +242,13 @@ class ClothSim:
         for k, p in enumerate(picker_pos):
             anchor = must_include[k]
             d = q - p
-            # EEF z points down, so EEF z in [lo, hi] maps to world dz in [-hi, -lo]
+            # FoldNet++ EEF approaches along -z (checked on Galbot grasps), so for a top-down grasp
+            # EEF z points up and the box z range maps to world dz directly
             inside = (
                 (np.abs(d[:, 0]) <= PICKER_BOX[0, 1])
                 & (np.abs(d[:, 1]) <= PICKER_BOX[1, 1])
-                & (d[:, 2] >= -PICKER_BOX[2, 1])
-                & (d[:, 2] <= -PICKER_BOX[2, 0])
+                & (d[:, 2] >= PICKER_BOX[2, 0])
+                & (d[:, 2] <= PICKER_BOX[2, 1])
             )
             rest_d = np.linalg.norm(self.rest - self.rest[anchor], axis=1)
             near = rest_d <= self.args.grasp_rest_radius
@@ -510,11 +511,10 @@ def render_video(path: Path, sim: ClothSim, faces: np.ndarray, fps: float):
 # ----------------------------------------------------------------------------- main
 
 
-def main():
-    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+def make_parser(description: str) -> argparse.ArgumentParser:
+    """Mesh, output and cloth-physics options shared with fold_test.py."""
+    p = argparse.ArgumentParser(description=description, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--mesh-id", type=int, default=0)
-    p.add_argument("--trials", type=int, default=4, help="trial 0 = flat sanity check")
-    p.add_argument("--flings", type=int, default=2)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--out", type=Path, default=Path("outputs/style3d_gate"))
     p.add_argument("--cache", type=Path, default=Path("outputs/style3d_gate/cache"))
@@ -535,18 +535,45 @@ def main():
     p.add_argument("--shear-ratio", type=float, default=1.0)
     p.add_argument("--bend-ke", type=float, default=7e-7)
     p.add_argument("--table-mu", type=float, default=0.5)
-    p.add_argument("--table-ke", type=float, default=1e1)
+    p.add_argument("--table-ke", type=float, default=1e3,
+                   help="table contact stiffness; Newton's example value 1e1 let pressed cloth sink 1-3 cm")
     p.add_argument("--table-kd", type=float, default=1e-5)
-    p.add_argument("--contact-radius", type=float, default=3e-3)
+    p.add_argument("--contact-radius", type=float, default=1.5e-3,
+                   help="cloth contact radius (thickness = 2x); 3e-3 puffed folded stacks, FoldNet++ uses 0.8 mm")
     p.add_argument("--pin-mass-factor", type=float, default=1e4, help="pinned vertex mass / max cloth vertex mass")
     p.add_argument("--grasp-rest-radius", type=float, default=0.08,
                    help="only pin vertices within this rest-shape distance of the grasp anchor (FoldNet++ 8 cm)")
+    p.add_argument("--release-settle", type=float, default=1.0)
+    return p
+
+
+def load_mesh(args):
+    """Init Warp, fetch and weld the FoldNet T-shirt; verts centered with unit geo-mean extent."""
+    wp.init()
+    if args.device.startswith("cuda") and not wp.is_cuda_available():
+        raise SystemExit("Warp sees no CUDA device; check the Warp init message above (driver vs. wheel CUDA version).")
+    mesh_dir = fetch_mesh(args.mesh_id, args.cache)
+    verts, faces = load_obj(mesh_dir / "mesh.obj")
+    keypoints = json.loads((mesh_dir / "mesh_info.json").read_text())["triangulation"]["keypoint_idx"]
+    n_raw = len(verts)
+    verts, faces, keypoints = weld(verts, faces, keypoints)
+    print(f"welded {n_raw - len(verts)} duplicate seam vertices")
+    verts[:, :2] -= (verts[:, :2].max(0) + verts[:, :2].min(0)) / 2
+    ext = verts[:, :2].max(0) - verts[:, :2].min(0)
+    verts /= math.sqrt(ext[0] * ext[1])  # unit geo-mean, rescaled per trial
+    print(f"mesh {args.mesh_id}: {len(verts)} verts, {len(faces)} tris, device={args.device}, dt={args.sim_dt}")
+    return verts, faces, keypoints
+
+
+def main():
+    p = make_parser(__doc__)
+    p.add_argument("--trials", type=int, default=4, help="trial 0 = flat sanity check")
+    p.add_argument("--flings", type=int, default=2)
     # episode
     p.add_argument("--hang-z", type=float, default=0.6)
     p.add_argument("--hang-time", type=float, default=1.0)
     p.add_argument("--drop-settle", type=float, default=2.0)
     p.add_argument("--flat-settle", type=float, default=1.5)
-    p.add_argument("--release-settle", type=float, default=1.0)
     p.add_argument("--lift-z", type=float, default=0.55)
     p.add_argument("--stretch-ratio", type=float, default=0.95)
     p.add_argument("--max-spread", type=float, default=0.7)
@@ -561,19 +588,7 @@ def main():
         args.hang_time, args.drop_settle, args.flat_settle, args.release_settle = 0.2, 0.4, 0.2, 0.2
         args.trials, args.flings, args.record_dt = min(args.trials, 2), 1, 0.2
 
-    wp.init()
-    if args.device.startswith("cuda") and not wp.is_cuda_available():
-        raise SystemExit("Warp sees no CUDA device; check the Warp init message above (driver vs. wheel CUDA version).")
-    mesh_dir = fetch_mesh(args.mesh_id, args.cache)
-    verts, faces = load_obj(mesh_dir / "mesh.obj")
-    keypoints = json.loads((mesh_dir / "mesh_info.json").read_text())["triangulation"]["keypoint_idx"]
-    n_raw = len(verts)
-    verts, faces, keypoints = weld(verts, faces, keypoints)
-    print(f"welded {n_raw - len(verts)} duplicate seam vertices")
-    verts[:, :2] -= (verts[:, :2].max(0) + verts[:, :2].min(0)) / 2
-    ext = verts[:, :2].max(0) - verts[:, :2].min(0)
-    verts /= math.sqrt(ext[0] * ext[1])  # unit geo-mean, rescaled per trial
-    print(f"mesh {args.mesh_id}: {len(verts)} verts, {len(faces)} tris, device={args.device}, dt={args.sim_dt}")
+    verts, faces, keypoints = load_mesh(args)
 
     args.out.mkdir(parents=True, exist_ok=True)
     logs = []
