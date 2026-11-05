@@ -4,8 +4,10 @@ Matches the real dataset's schema so the two can be mixed in training:
   fps 30; observation.state / action: 16 joints (arm_l 1-7, arm_r 1-7, gripper_l_joint1,
   gripper_r_joint1); observation.eef_pose / action.eef_pose: 14 (per arm x y z qw qx qy qz);
   observation.images.{head 376x672, wrist_left 240x424, wrist_right 240x424} as h264 video.
-Grippers are 0 open / 1.1 closed (what teleop logs show on cloth). action is the next frame's joint
-target, as the real recorder stores the commanded joints.
+Grippers are 0 open / 1.1 closed (what teleop logs show on cloth). action is the joint state
+ACTION_LEAD frames ahead: the real action is the teleop command, which the measured state reaches
+about 14 frames (0.47 s) later (mean |action[t] - state[t+k]| over 24 real episodes is smallest at
+k = 14, 0.0047 rad; 0.036 rad at k = 0).
 
 eef_pose follows the real data exactly (fit on its parquet, 0.0 mm residual): link7 pose with lift at 0,
 offset 8 cm along link7 -z, a fixed per-arm rotation, in a base frame 25.4 mm along +x from base_link.
@@ -34,6 +36,7 @@ JOINT_NAMES = ([f"arm_l_joint{i}" for i in range(1, 8)] + [f"arm_r_joint{i}" for
                + ["gripper_l_joint1", "gripper_r_joint1"])
 EEF_NAMES = [f"eef_{s}_{c}" for s in "lr" for c in ("x", "y", "z", "qw", "qx", "qy", "qz")]
 GRIPPER_CLOSED = 1.1
+ACTION_LEAD = 14  # frames the real teleop command leads the measured joint state
 # real-data eef frame relative to link7, and its base relative to base_link (lift 0)
 EEF_TOOL = {"l": homogeneous(np.array([[0.0, -1.0, 0.0], [0.0, 0.0, 1.0], [-1.0, 0.0, 0.0]]), [0.0, 0.0, -0.08]),
             "r": homogeneous(np.array([[0.0, 1.0, 0.0], [0.0, 0.0, -1.0], [-1.0, 0.0, 0.0]]), [0.0, 0.0, -0.08])}
@@ -96,7 +99,7 @@ def decode(mp4: Path):
         return [f.to_ndarray(format="rgb24") for f in c.decode(video=0)]
 
 
-def trial_frames(trial: Path):
+def trial_frames(trial: Path, lead: int = ACTION_LEAD):
     d = np.load(trial / "frames.npz")
     if "joint" not in d:
         raise ValueError(f"{trial}: no robot joints (run fold_test.py with --robot)")
@@ -108,10 +111,11 @@ def trial_frames(trial: Path):
     joint[: known[0]] = joint[known[0]]  # before the first robot move: hold its first pose
     grip = d["grip"].astype(float) * GRIPPER_CLOSED
     state = np.concatenate([joint[:, 0], joint[:, 1], grip], axis=1).astype(np.float32)
-    action = np.vstack([state[1:], state[-1:]])  # next-frame target; the last frame holds
     images = {cam: decode(trial / f"{cam}.mp4") for cam in CAMERAS}
     n = min(len(state), *(len(v) for v in images.values()))
-    return state[:n], action[:n], {c: v[:n] for c, v in images.items()}
+    state = state[:n]
+    action = state[np.minimum(np.arange(n) + lead, n - 1)]  # state `lead` frames on; the end holds
+    return state, action, {c: v[:n] for c, v in images.items()}
 
 
 def trial_ok(trial: Path) -> bool:
@@ -131,6 +135,8 @@ def main():
     p.add_argument("--root", type=Path, help="local dataset directory (must not exist)")
     p.add_argument("--task", default="fold the t-shirt", help="task string (the real dataset's by default)")
     p.add_argument("--include-failed", action="store_true", help="also export trials marked FAIL")
+    p.add_argument("--action-lead", type=int, default=ACTION_LEAD,
+                   help="action = joint state this many frames ahead (real teleop lag)")
     p.add_argument("--check-eef", type=Path, help="validate eef_pose against a real dataset parquet and exit")
     args = p.parse_args()
     if args.check_eef:
@@ -158,7 +164,7 @@ def main():
         if not args.include_failed and not trial_ok(trial):
             print(f"skip {trial} (FAIL in metrics.json)")
             continue
-        state, action, images = trial_frames(trial)
+        state, action, images = trial_frames(trial, args.action_lead)
         for i in range(len(state)):
             frame = {"task": args.task, "observation.state": state[i], "action": action[i],
                      "observation.eef_pose": fk(state[i]), "action.eef_pose": fk(action[i])}
