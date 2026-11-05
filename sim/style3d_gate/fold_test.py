@@ -18,7 +18,9 @@ folded keypoints, and spring-back (footprint growth between release and settling
 
 import json
 import math
+import sys
 import time
+from pathlib import Path
 
 import numpy as np
 
@@ -37,6 +39,8 @@ from gate_fling import (
     sync_paths,
     unique_edges,
 )
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "sg2_newton"))
 
 CONFIGS = [(-1, False), (1, False), (-1, True), (1, True)]  # (collar x direction, back face up)
 
@@ -78,6 +82,11 @@ class FoldEpisode:
         self.edges = unique_edges(faces)
         self.rest_len = np.linalg.norm(sim.rest[self.edges[:, 0]] - sim.rest[self.edges[:, 1]], axis=1)
         self.t_wall = time.time()
+        self.robot = None
+        if args.robot:  # pickers follow the TCP an SG2 IK actually reaches
+            from sg2_robot import SG2Arms
+
+            self.robot = SG2Arms(base_y=args.robot_base_y, height=args.robot_height, tilt=args.grasp_tilt)
 
     def top(self, name: str) -> int:
         q = self.sim.q()
@@ -112,14 +121,25 @@ class FoldEpisode:
             # release just above whatever already lies at the goal; placing at the grasp height
             # pushed the pinned flap through the folded layers and into the table
             goals = [np.array([g[0], g[1], self.surface_z(g[:2]) + self.args.place_clearance]) for g in goals]
-        info = sim.grasp(np.stack(starts), anchors)
         if kind == "arc":
             paths = [arc_path(s, g, self.args.fold_lift_ratio, self.args.fold_clearance) for s, g in zip(starts, goals)]
         else:  # drag: lift a little, slide, keep the height
             paths = [np.concatenate([linear_path(s, s + [0, 0, self.args.drag_lift], LINEAR_STEP),
                                      linear_path(s + [0, 0, self.args.drag_lift], g, LINEAR_STEP)[1:]])
                      for s, g in zip(starts, goals)]
-        sim.follow(sync_paths(paths), name)
+        waypoints = sync_paths(paths)
+        robot_stats = {}
+        if self.robot is not None:
+            order = self.robot.assign(waypoints)
+            reached_grasp, _, st = self.robot.approach(np.stack(starts), order, f"{name}_approach")
+            robot_stats["approach"] = st
+            # grasp where the hands actually are; a miss shows up as a large approach track_err
+            starts = [reached_grasp[-1, k] for k in range(2)]
+            waypoints, _, st = self.robot.realize(waypoints, name, order)
+            robot_stats["carry"] = st
+            robot_stats["order"] = list(order)
+        info = sim.grasp(np.stack(starts), anchors)
+        sim.follow(waypoints, name)
         sim.release()
         cov_release = self.coverage()
         sim.settle(self.args.release_settle, f"{name}_settle")
@@ -127,12 +147,20 @@ class FoldEpisode:
         entry = {"name": name, "t": sim.t, "coverage": self.coverage(), "coverage_at_release": cov_release,
                  **health(q, qd, self.edges, self.rest_len, self.args.contact_radius),
                  "wall_s": time.time() - self.t_wall, **info}
+        if robot_stats:
+            entry["robot"] = robot_stats
         entry["springback"] = entry["coverage"] / max(cov_release, 1e-6)
         if check:  # placement error of the carried keypoints, measured on the keypoint's top vertex
             entry["place_err"] = [float(np.linalg.norm(q[self.top(k)][:2] - g[:2])) for k, g in zip(check, goals)]
         self.log["phases"].append(entry)
         pe = f" place_err={[round(100 * e, 1) for e in entry['place_err']]}cm" if check else ""
-        print(f"  [trial {self.log['trial']}] {name:<6} t={sim.t:6.2f}s cov={entry['coverage']:.3f} "
+        rb = ""
+        if robot_stats:
+            c = robot_stats["carry"]
+            rb = (f" ik_ok={[round(c[s]['ik_ok'], 2) for s in robot_stats['order']]}"
+                  f" track_err={[round(100 * c[s]['track_err_max'], 1) for s in robot_stats['order']]}cm"
+                  f" approach_err={[round(100 * robot_stats['approach'][s]['track_err_max'], 1) for s in robot_stats['order']]}cm")
+        print(f"  [trial {self.log['trial']}] {name:<6} t={sim.t:6.2f}s cov={entry['coverage']:.3f}{rb} "
               f"springback={entry['springback']:.3f} strain_p99={entry['strain_p99']:.3f} "
               f"below={entry['below_table_frac']:.4f} pinned={info['pinned']}{pe} wall={entry['wall_s']:.0f}s",
               flush=True)
@@ -248,9 +276,13 @@ def run_trial(args, trial, verts0, faces, keypoints):
 
     trial_dir = args.out / f"trial_{trial:02d}"
     trial_dir.mkdir(parents=True, exist_ok=True)
+    extra = {}
+    if ep.robot is not None:  # 5 Hz joint targets (l, r) incl. approach moves, for the dataset
+        phases, robot_q = ep.robot.joint_trajectory()
+        extra = {"robot_q": robot_q.astype(np.float32), "robot_phase": np.array(phases)}
     np.savez_compressed(trial_dir / "frames.npz", q=np.stack(sim.frames).astype(np.float32), faces=faces,
                         t=np.array(sim.frame_t), phase=np.array(sim.frame_phase),
-                        pickers=np.stack(sim.frame_pickers).astype(np.float32))
+                        pickers=np.stack(sim.frame_pickers).astype(np.float32), **extra)
     if not args.no_video:
         render_video(trial_dir / "video.mp4", sim, faces, 1.0 / args.record_dt)
     return log
@@ -267,6 +299,10 @@ def main():
     p.add_argument("--place-clearance", type=float, default=0.01, help="release height above the cloth at the goal")
     p.add_argument("--drag-dist", type=float, default=0.08)
     p.add_argument("--drag-lift", type=float, default=0.01)
+    p.add_argument("--robot", action="store_true", help="drive the pickers through SG2 IK (sim/sg2_newton)")
+    p.add_argument("--robot-base-y", type=float, default=-0.45, help="arm_base_link y; cloth center is y=0")
+    p.add_argument("--robot-height", type=float, default=0.55, help="arm_base_link above the table (lift 0)")
+    p.add_argument("--grasp-tilt", type=float, default=35.0, help="grasp approach below horizontal [deg]")
     args = p.parse_args()
     if args.quick:
         args.sim_dt, args.iterations, args.linear_iterations = 4e-3, 4, 6

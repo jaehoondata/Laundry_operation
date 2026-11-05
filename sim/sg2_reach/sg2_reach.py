@@ -17,15 +17,25 @@ import argparse
 import json
 import math
 import multiprocessing
+import os
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
-import h5py
 import numpy as np
 
-DEFAULT_URDF = Path.home() / (
-    "deploy/VAI_AIWORKER/ros2_ws/install/ffw_description/share/ffw_description/urdf/"
-    "ffw_sg2_rev1_follower/ffw_sg2_follower.urdf"
+def find_ros_install() -> Path:
+    """ros2_ws/install holding ffw_description: $SG2_ROS_INSTALL, else the Mac deploy copy or the lab PC's."""
+    candidates = [os.environ.get("SG2_ROS_INSTALL"),
+                  Path.home() / "deploy/VAI_AIWORKER/ros2_ws/install",
+                  Path.home() / "Desktop/VAI_AIWORKER/ros2_ws/install"]
+    for c in candidates:
+        if c and (Path(c) / "ffw_description").is_dir():
+            return Path(c)
+    raise FileNotFoundError("ffw_description not found; set SG2_ROS_INSTALL to your ros2_ws/install")
+
+
+DEFAULT_URDF = find_ros_install() / (
+    "ffw_description/share/ffw_description/urdf/ffw_sg2_rev1_follower/ffw_sg2_follower.urdf"
 )
 POS_TOL = 0.005
 ROT_TOL = math.radians(3.0)
@@ -152,6 +162,8 @@ def six_to_matrix(six):
 
 
 def load_episodes(ep_dir: Path, n: int, stride: int):
+    import h5py  # only needed here; the robot code imports this module without h5py installed
+
     eps = []
     for p in sorted(ep_dir.glob("*.h5"))[:n]:
         with h5py.File(p, "r") as f:

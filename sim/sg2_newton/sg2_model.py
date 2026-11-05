@@ -9,13 +9,17 @@ The FoldNet++-aligned TCP is end_effector_{l,r}_link (approach -z, fingers close
 """
 
 import re
+import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import newton
 
-ROS_INSTALL = Path.home() / "deploy/VAI_AIWORKER/ros2_ws/install"
-URDF = ROS_INSTALL / "ffw_description/share/ffw_description/urdf/ffw_sg2_rev1_follower/ffw_sg2_follower.urdf"
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "sg2_reach"))
+from sg2_reach import DEFAULT_URDF as URDF  # noqa: E402
+from sg2_reach import find_ros_install  # noqa: E402
+
+ROS_INSTALL = find_ros_install()
 ARM_JOINTS = {s: [f"arm_{s}_joint{i}" for i in range(1, 8)] for s in "lr"}
 TCP_LINKS = {"l": "end_effector_l_link", "r": "end_effector_r_link"}
 

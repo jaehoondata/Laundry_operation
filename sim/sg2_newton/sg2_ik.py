@@ -20,12 +20,9 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "sg2_reach"))
-from sg2_reach import POS_TOL, ROT_TOL, ArmChain, arm_base_pose, load_episodes, rot_error  # noqa: E402
+from sg2_reach import DEFAULT_URDF, POS_TOL, ROT_TOL, ArmChain, arm_base_pose, load_episodes, rot_error  # noqa: E402,F401
 
-DEFAULT_URDF = Path.home() / (
-    "deploy/VAI_AIWORKER/ros2_ws/install/ffw_description/share/ffw_description/urdf/"
-    "ffw_sg2_rev1_follower/ffw_sg2_follower.urdf"
-)
+
 # J1..J7; twist (J3, J5) and wrist (J6, J7) deviations cost the most
 POSTURE_WEIGHTS = np.array([0.25, 0.25, 4.0, 0.25, 4.0, 2.5, 2.5])
 # robot "idle" pose from VR_teleoperation/qpos/sg2_joint_qpos.json: elbow bent 90 deg
