@@ -248,6 +248,10 @@ class ClothSim:
         self.targets = wp.zeros(2, dtype=wp.vec3, device=args.device)
         self.target_vel = wp.zeros(2, dtype=wp.vec3, device=args.device)
         self.frames, self.frame_t, self.frame_phase, self.frame_pickers = [], [], [], []
+        # robot state per recorded frame (fold_test --robot); NaN / False when no robot is driven
+        self.cur_joint = np.full((2, 7), np.nan)  # arm joints, (l, r)
+        self.cur_grip = np.zeros(2, dtype=bool)  # gripper closed, (l, r)
+        self.frame_joint, self.frame_grip = [], []
         self.next_record = 0.0
         self.phase = "init"
         self.cur_targets = np.zeros((2, 3))
@@ -270,6 +274,11 @@ class ClothSim:
         info = {"pinned": [], "dropped_far": [], "manipulable": []}
         for k, p in enumerate(picker_pos):
             anchor = must_include[k]
+            if anchor is None:  # one-hand move: this picker stays open
+                info["pinned"].append(0)
+                info["dropped_far"].append(0)
+                info["manipulable"].append(None)
+                continue
             d = q - p
             # FoldNet++ EEF approaches along -z (checked on Galbot grasps), so for a top-down grasp
             # EEF z points up and the box z range maps to world dz directly
@@ -328,6 +337,8 @@ class ClothSim:
             self.frame_t.append(self.t)
             self.frame_phase.append(self.phase)
             self.frame_pickers.append(self.cur_targets.copy() if self.pinned is not None else np.full((2, 3), np.nan))
+            self.frame_joint.append(self.cur_joint.copy())
+            self.frame_grip.append(self.cur_grip.copy())
             self.next_record += self.args.record_dt
 
     def substep(self):
@@ -347,14 +358,17 @@ class ClothSim:
         for _ in range(int(round(duration / self.dt))):
             self.substep()
 
-    def follow(self, waypoints: np.ndarray, phase: str, step_dt: float = ACTION_DT):
-        """Track picker waypoints [N+1, 2, 3] spaced step_dt apart (piecewise linear)."""
+    def follow(self, waypoints: np.ndarray, phase: str, step_dt: float = ACTION_DT, joints=None):
+        """Track picker waypoints [N+1, 2, 3] spaced step_dt apart (piecewise linear).
+        joints [N+1, 2, 7] (l, r), if given, is interpolated the same way for the recorded frames."""
         self.phase = phase
         n_per = int(round(step_dt / self.dt))
         for w in range(len(waypoints) - 1):
             a, b = waypoints[w], waypoints[w + 1]
             self.target_vel.assign((b - a) / step_dt)
             for s in range(n_per):
+                if joints is not None:
+                    self.cur_joint = joints[w] + (joints[w + 1] - joints[w]) * (s + 1) / n_per
                 self.cur_targets = a + (b - a) * (s + 1) / n_per
                 self.targets.assign(self.cur_targets)
                 self.substep()

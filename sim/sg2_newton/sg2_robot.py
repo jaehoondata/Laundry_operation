@@ -38,8 +38,12 @@ class SG2Arms:
         return self.iks[side].chain.fk(self.q[side] if q is None else q, self.base)[0][:3, 3]
 
     def _track(self, side, path, q0):
-        """Solve a position path [N, 3] from q0. Returns joint path, reached TCP path, ok flags."""
+        """Solve a position path [N, 3] from q0. Returns joint path, reached TCP path, ok flags.
+        A NaN path (one-hand move, this arm idle) holds q0."""
         ik, q = self.iks[side], q0.copy()
+        if np.isnan(path).all():
+            hold = ik.chain.fk(q0, self.base)[0][:3, 3]
+            return np.repeat(q0[None], len(path), 0), np.repeat(hold[None], len(path), 0), np.ones(len(path), bool)
         qs, reached, oks = [], [], []
         for p in path:
             q, ok, _, _ = ik.solve(self.base, self.target(side, p), q)
@@ -54,6 +58,8 @@ class SG2Arms:
         for order in (("l", "r"), ("r", "l")):
             err = 0.0
             for k, side in enumerate(order):
+                if np.isnan(waypoints[:, k]).all():
+                    continue
                 _, reached, _ = self._track(side, waypoints[:, k], self.q[side])
                 err += float(np.linalg.norm(reached - waypoints[:, k], axis=1).sum())
             if best is None or err < best[0]:
@@ -62,7 +68,8 @@ class SG2Arms:
 
     def realize(self, waypoints, phase, order=None):
         """Move both arms along waypoints [N, 2, 3]; commit the joint state. Returns reached TCP
-        positions [N, 2, 3] (picker k follows arm order[k]) and per-step stats."""
+        positions [N, 2, 3] (picker k follows arm order[k]), the order, per-arm stats, and the
+        joint path [N, 2, 7] in (l, r) order."""
         order = order or self.assign(waypoints)
         reached = np.zeros_like(waypoints)
         stats = {}
@@ -70,29 +77,36 @@ class SG2Arms:
             qs, rp, oks = self._track(side, waypoints[:, k], self.q[side])
             reached[:, k] = rp
             prev = np.vstack([self.q[side], qs[:-1]])
+            idle = np.isnan(waypoints[:, k]).all()
             stats[side] = {
                 "ik_ok": float(oks.mean()),
-                "track_err_max": float(np.linalg.norm(rp - waypoints[:, k], axis=1).max()),
+                "track_err_max": 0.0 if idle else float(np.linalg.norm(rp - waypoints[:, k], axis=1).max()),
                 "joint_speed_max": float(np.abs(qs - prev).max() / 0.2),
             }
             self.q[side] = qs[-1]
             stats[side]["_qs"] = qs
         for i in range(len(waypoints)):
             self.traj.append((phase, {s: stats[s]["_qs"][i] for s in order}))
+        joints = np.stack([stats[s]["_qs"] for s in SIDES], axis=1)  # [N, 2, 7] in (l, r) order
         for s in order:
             stats[s].pop("_qs")
-        return reached, order, stats
+        return reached, order, stats, joints
 
     def approach(self, grasp_points, order, phase, hover=0.05, step=0.03):
         """Move each arm (cloth untouched) from its TCP to above its grasp point and down onto it."""
         if not self.ready:  # episode start: put the arms in a ready pose above their first grasp
             for k, side in enumerate(order):
+                if np.isnan(grasp_points[k]).any():
+                    continue
                 above = self.target(side, grasp_points[k] + [0.0, 0.0, hover])
                 self.q[side] = PostureIK(self.iks[side].chain, max_step=10.0, iters=300).solve(
                     self.base, above, self.iks[side].q_ref)[0]
             self.ready = True
         paths = []
         for k, side in enumerate(order):
+            if np.isnan(grasp_points[k]).any():  # idle arm in a one-hand move
+                paths.append(np.full((2, 3), np.nan))
+                continue
             start, goal = self.tcp(side), grasp_points[k]
             above = goal + [0.0, 0.0, hover]
             a = np.linspace(0, 1, max(2, math.ceil(np.linalg.norm(above - start) / step) + 1))[:, None]

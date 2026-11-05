@@ -43,6 +43,16 @@ from gate_fling import (
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "sg2_newton"))
 
 CONFIGS = [(-1, False), (1, False), (-1, True), (1, True)]  # (collar x direction, back face up)
+# language labels per step, in the style of the FoldNet++ subtask annotations
+SUBTASKS = {
+    "fold1": "Fold the half of the T-shirt near the robot onto the centerline.",
+    "drag1": "Pull the T-shirt toward the robot.",
+    "fold2": "Fold the far half of the T-shirt onto the centerline.",
+    "drag2": "Push the T-shirt back to the center.",
+    "fold3": "Fold the collar half of the T-shirt onto the hem half.",
+    "flip": "Lift the folded edge and flip the T-shirt over.",
+    "drag3": "Slide the folded T-shirt aside.",
+}
 
 
 def quat_mul(a, b):
@@ -113,38 +123,52 @@ class FoldEpisode:
         return q[:, :2].min(0), q[:, :2].max(0)
 
     def move(self, name: str, anchors: list[int], goals: list[np.ndarray], kind: str, check: list[str] | None = None):
-        """Grasp both anchors, carry them to goals (arc = fold, line = drag), release, settle."""
+        """Grasp the anchors, carry them to goals (arc = fold, line = drag), release, settle.
+        An anchor/goal of None makes it a one-hand move: that picker (and arm) stays idle."""
         sim = self.sim
         q = sim.q()
-        starts = [q[i].copy() for i in anchors]
+        starts = [np.full(3, np.nan) if i is None else q[i].copy() for i in anchors]
         if kind == "arc":
             # release just above whatever already lies at the goal; placing at the grasp height
             # pushed the pinned flap through the folded layers and into the table
-            goals = [np.array([g[0], g[1], self.surface_z(g[:2]) + self.args.place_clearance]) for g in goals]
-        if kind == "arc":
-            paths = [arc_path(s, g, self.args.fold_lift_ratio, self.args.fold_clearance) for s, g in zip(starts, goals)]
-        else:  # drag: lift a little, slide, keep the height
-            paths = [np.concatenate([linear_path(s, s + [0, 0, self.args.drag_lift], LINEAR_STEP),
-                                     linear_path(s + [0, 0, self.args.drag_lift], g, LINEAR_STEP)[1:]])
-                     for s, g in zip(starts, goals)]
+            goals = [None if g is None else np.array([g[0], g[1], self.surface_z(g[:2]) + self.args.place_clearance])
+                     for g in goals]
+
+        def path(s, g):
+            if g is None:
+                return np.full((2, 3), np.nan)
+            if kind == "arc":
+                return arc_path(s, g, self.args.fold_lift_ratio, self.args.fold_clearance)
+            # drag: lift a little, slide, keep the height
+            lifted = s + [0, 0, self.args.drag_lift]
+            return np.concatenate([linear_path(s, lifted, LINEAR_STEP), linear_path(lifted, g, LINEAR_STEP)[1:]])
+
+        paths = [path(s, g) for s, g in zip(starts, goals)]
         waypoints = sync_paths(paths)
         robot_stats = {}
+        joints = None
         if self.robot is not None:
             order = self.robot.assign(waypoints)
-            reached_grasp, _, st = self.robot.approach(np.stack(starts), order, f"{name}_approach")
+            reached_grasp, _, st, j_app = self.robot.approach(np.stack(starts), order, f"{name}_approach")
             robot_stats["approach"] = st
+            # the cloth keeps simulating (untouched) while the arms move in, so frames and joints
+            # share one timeline
+            sim.follow(reached_grasp, f"{name}_approach", joints=j_app)
             # grasp where the hands actually are; a miss shows up as a large approach track_err
             starts = [reached_grasp[-1, k] for k in range(2)]
-            waypoints, _, st = self.robot.realize(waypoints, name, order)
+            waypoints, _, st, joints = self.robot.realize(waypoints, name, order)
             robot_stats["carry"] = st
             robot_stats["order"] = list(order)
+            sim.cur_grip = np.array([anchors[order.index(side)] is not None for side in ("l", "r")])
         info = sim.grasp(np.stack(starts), anchors)
-        sim.follow(waypoints, name)
+        sim.follow(waypoints, name, joints=joints)
         sim.release()
+        sim.cur_grip = np.zeros(2, dtype=bool)
         cov_release = self.coverage()
         sim.settle(self.args.release_settle, f"{name}_settle")
         q, qd = sim.q(), sim.qd()
-        entry = {"name": name, "t": sim.t, "coverage": self.coverage(), "coverage_at_release": cov_release,
+        entry = {"name": name, "subtask": SUBTASKS.get(name, name), "t": sim.t,
+                 "coverage": self.coverage(), "coverage_at_release": cov_release,
                  **health(q, qd, self.edges, self.rest_len, self.args.contact_radius),
                  "wall_s": time.time() - self.t_wall, **info}
         if robot_stats:
@@ -198,7 +222,13 @@ class FoldEpisode:
         lo, hi = self.bbox()
         q = sim.q()
         anchors = [self.top_near((x, hi[1] - 0.02)) for x in (q[sh2, 0], q[co2, 0])]
-        self.move("drag2", anchors, [q[i] + [0, a.drag_dist, a.drag_lift] for i in anchors], "line")
+        shift = 0.0
+        if a.sequence == "sg2":
+            # also slide along x so the fold3 stack (the hem half) ends centered between the arms
+            x_mid = (lo[0] + hi[0]) / 2
+            x_hem = hi[0] if collar_dir < 0 else lo[0]
+            shift = -(x_mid + x_hem) / 2
+        self.move("drag2", anchors, [q[i] + [shift, a.drag_dist, a.drag_lift] for i in anchors], "line")
 
         # fold3: collar half onto the hem half (fold line across x)
         lo, hi = self.bbox()
@@ -209,6 +239,17 @@ class FoldEpisode:
         q = sim.q()
         goals = [np.array([2 * x_mid - q[i, 0], q[i, 1], q[i, 2]]) for i in anchors]
         self.move("fold3", anchors, goals, "arc")
+
+        if a.sequence == "sg2":
+            # flip with one hand (FoldNet++ Galbot style): the arm on the free-edge side takes the
+            # fold-edge midpoint over the far edge, staying inside its own half of the workspace
+            lo, hi = self.bbox()
+            yc = (lo[1] + hi[1]) / 2
+            x_edge, x_far = (lo[0] + 0.02, hi[0]) if collar_dir < 0 else (hi[0] - 0.02, lo[0])
+            grip = self.top_near((x_edge, yc))
+            q = sim.q()
+            self.move("flip", [grip, None], [np.array([2 * x_far - q[grip, 0], q[grip, 1], q[grip, 2]]), None], "arc")
+            return
 
         # flip: lift the folded edge and turn the stack over its opposite x edge
         lo, hi = self.bbox()
@@ -280,6 +321,8 @@ def run_trial(args, trial, verts0, faces, keypoints):
     if ep.robot is not None:  # 5 Hz joint targets (l, r) incl. approach moves, for the dataset
         phases, robot_q = ep.robot.joint_trajectory()
         extra = {"robot_q": robot_q.astype(np.float32), "robot_phase": np.array(phases)}
+    if ep.robot is not None:  # per recorded frame, for rendering and the dataset's observation.state
+        extra.update(joint=np.stack(sim.frame_joint).astype(np.float32), grip=np.stack(sim.frame_grip))
     np.savez_compressed(trial_dir / "frames.npz", q=np.stack(sim.frames).astype(np.float32), faces=faces,
                         t=np.array(sim.frame_t), phase=np.array(sim.frame_phase),
                         pickers=np.stack(sim.frame_pickers).astype(np.float32), **extra)
@@ -299,6 +342,8 @@ def main():
     p.add_argument("--place-clearance", type=float, default=0.01, help="release height above the cloth at the goal")
     p.add_argument("--drag-dist", type=float, default=0.08)
     p.add_argument("--drag-lift", type=float, default=0.01)
+    p.add_argument("--sequence", choices=["foldnet", "sg2"], default="foldnet",
+                   help="sg2: drag2 also centers the fold3 stack, one-hand flip, no drag3 (fits the SG2 workspace)")
     p.add_argument("--robot", action="store_true", help="drive the pickers through SG2 IK (sim/sg2_newton)")
     p.add_argument("--robot-base-y", type=float, default=-0.45, help="arm_base_link y; cloth center is y=0")
     p.add_argument("--robot-height", type=float, default=0.55, help="arm_base_link above the table (lift 0)")
