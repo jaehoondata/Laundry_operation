@@ -25,7 +25,7 @@ from pathlib import Path
 import numpy as np
 
 from gate_fling import (
-    LINEAR_STEP,
+    ACTION_DT,
     ClothSim,
     Diverged,
     health,
@@ -71,8 +71,8 @@ def axis_quat(axis, angle):
     return np.array([axis[0] * s, axis[1] * s, axis[2] * s, math.cos(angle / 2)])
 
 
-def arc_path(start: np.ndarray, goal: np.ndarray, lift_ratio: float, clearance: float) -> np.ndarray:
-    """Half-circle-like path from start to goal (fold motion), resampled at LINEAR_STEP."""
+def arc_path(start: np.ndarray, goal: np.ndarray, lift_ratio: float, clearance: float, step: float) -> np.ndarray:
+    """Half-circle-like path from start to goal (fold motion), resampled every `step` metres."""
     th = np.linspace(0.0, math.pi, 400)
     c = (start + goal) / 2
     u = start - c
@@ -81,7 +81,7 @@ def arc_path(start: np.ndarray, goal: np.ndarray, lift_ratio: float, clearance: 
     # end heights may differ (placing onto a stack): blend them, then add the arc lift
     pts[:, 2] = start[2] + (goal[2] - start[2]) * (1 - np.cos(th)) / 2 + np.sin(th) * (lift_ratio * r + clearance)
     s = np.concatenate([[0], np.cumsum(np.linalg.norm(np.diff(pts, axis=0), axis=1))])
-    targets = np.linspace(0, s[-1], max(1, math.ceil(s[-1] / LINEAR_STEP)) + 1)
+    targets = np.linspace(0, s[-1], max(1, math.ceil(s[-1] / step)) + 1)
     return np.stack([np.interp(targets, s, pts[:, k]) for k in range(3)], axis=1)
 
 
@@ -92,6 +92,10 @@ class FoldEpisode:
         self.edges = unique_edges(faces)
         self.rest_len = np.linalg.norm(sim.rest[self.edges[:, 0]] - sim.rest[self.edges[:, 1]], axis=1)
         self.t_wall = time.time()
+        # metres per 0.2 s action step; one speed factor per trial (log["speed_scale"])
+        scale = log.get("speed_scale", 1.0)
+        self.carry_step = args.carry_speed * scale * ACTION_DT
+        self.approach_step = args.approach_speed * scale * ACTION_DT
         self.robot = None
         if args.robot:  # pickers follow the TCP an SG2 IK actually reaches
             from sg2_robot import SG2Arms
@@ -138,10 +142,10 @@ class FoldEpisode:
             if g is None:
                 return np.full((2, 3), np.nan)
             if kind == "arc":
-                return arc_path(s, g, self.args.fold_lift_ratio, self.args.fold_clearance)
+                return arc_path(s, g, self.args.fold_lift_ratio, self.args.fold_clearance, self.carry_step)
             # drag: lift a little, slide, keep the height
             lifted = s + [0, 0, self.args.drag_lift]
-            return np.concatenate([linear_path(s, lifted, LINEAR_STEP), linear_path(lifted, g, LINEAR_STEP)[1:]])
+            return np.concatenate([linear_path(s, lifted, self.carry_step), linear_path(lifted, g, self.carry_step)[1:]])
 
         paths = [path(s, g) for s, g in zip(starts, goals)]
         waypoints = sync_paths(paths)
@@ -149,7 +153,8 @@ class FoldEpisode:
         joints = None
         if self.robot is not None:
             order = self.robot.assign(waypoints)
-            reached_grasp, _, st, j_app = self.robot.approach(np.stack(starts), order, f"{name}_approach")
+            reached_grasp, _, st, j_app = self.robot.approach(
+                np.stack(starts), order, f"{name}_approach", step=self.approach_step, transit=self.args.transit_height)
             robot_stats["approach"] = st
             # the cloth keeps simulating (untouched) while the arms move in, so frames and joints
             # share one timeline
@@ -285,6 +290,12 @@ def verdict(log) -> tuple[list[str], list[str]]:
             warns.append(f"{p['name']}: footprint grew {100 * (p['springback'] - 1):.0f}% after release")
         if max(p.get("place_err", [0])) > 0.04:
             warns.append(f"{p['name']}: placement error {100 * max(p['place_err']):.1f} cm")
+    c = log.get("arm_clearance")
+    if c:
+        if c["arm_arm_min"] < c["limit"]:
+            fails.append(f"arms {1000 * c['arm_arm_min']:.0f} mm apart (limit {1000 * c['limit']:.0f} mm)")
+        if c["arm_body_min"] < c["limit"]:
+            fails.append(f"arm {1000 * c['arm_body_min']:.0f} mm from the torso (limit {1000 * c['limit']:.0f} mm)")
     final = log["phases"][-1].get("coverage", 1.0)
     if final > 0.4:
         warns.append(f"final footprint {final:.2f} of flat (expected ~0.25)")
@@ -305,7 +316,9 @@ def run_trial(args, trial, verts0, faces, keypoints):
     rv = quat_rotate(rot, verts)
     pos = np.array([0.0, 0.0, -rv[:, 2].min() + 0.005])
     sim = ClothSim(args, verts, faces, panel, panel_idx, pos, rot)
-    log = {"trial": trial, "collar_dir": collar_dir, "back_up": back_up, "scale": scale, "phases": []}
+    speed_scale = rng.uniform(1 - args.speed_jitter, 1 + args.speed_jitter)
+    log = {"trial": trial, "collar_dir": collar_dir, "back_up": back_up, "scale": scale,
+           "speed_scale": speed_scale, "phases": []}
     print(f"  [trial {trial}] collar {'-x' if collar_dir < 0 else '+x'}, {'back' if back_up else 'front'} face up")
     ep = FoldEpisode(args, sim, faces, keypoints, flat_area, log)
     try:
@@ -326,6 +339,13 @@ def run_trial(args, trial, verts0, faces, keypoints):
     np.savez_compressed(trial_dir / "frames.npz", q=np.stack(sim.frames).astype(np.float32), faces=faces,
                         t=np.array(sim.frame_t), phase=np.array(sim.frame_phase),
                         pickers=np.stack(sim.frame_pickers).astype(np.float32), **extra)
+    if ep.robot is not None:  # the IK has no collision term: measure how close the arms came
+        from check_arm_collision import clearance
+
+        log["arm_clearance"] = {**clearance(extra["joint"], extra["grip"], args.record_dt), "limit": args.arm_clearance}
+        c = log["arm_clearance"]
+        print(f"  [trial {trial}] arm clearance: arm-arm {1000 * c['arm_arm_min']:.0f} mm, "
+              f"arm-torso {1000 * c['arm_body_min']:.0f} mm", flush=True)
     if not args.no_video:
         render_video(trial_dir / "video.mp4", sim, faces, 1.0 / args.record_dt)
     return log
@@ -348,6 +368,14 @@ def main():
     p.add_argument("--robot-base-y", type=float, default=-0.45, help="arm_base_link y; cloth center is y=0")
     p.add_argument("--robot-height", type=float, default=0.55, help="arm_base_link above the table (lift 0)")
     p.add_argument("--grasp-tilt", type=float, default=35.0, help="grasp approach below horizontal [deg]")
+    # speeds and heights from the real teleop data (laundry_fold_tshirt_arm16): hand speed while
+    # moving p50 0.06 / p90 0.13 m/s; open hand ~11 cm above grasp level
+    p.add_argument("--carry-speed", type=float, default=0.06, help="hand speed while holding cloth [m/s]")
+    p.add_argument("--approach-speed", type=float, default=0.10, help="hand speed with an empty hand [m/s]")
+    p.add_argument("--speed-jitter", type=float, default=0.2, help="per-trial speed factor in 1 +- this")
+    p.add_argument("--transit-height", type=float, default=0.12, help="empty-hand travel height above the table [m]")
+    p.add_argument("--arm-clearance", type=float, default=0.01,
+                   help="FAIL a trial whose arms come closer than this to each other or the torso [m]")
     args = p.parse_args()
     if args.quick:
         args.sim_dt, args.iterations, args.linear_iterations = 4e-3, 4, 6

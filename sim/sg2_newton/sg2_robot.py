@@ -17,6 +17,9 @@ from sg2_ik import DEFAULT_URDF, IDLE, SHOULDER_X, PostureIK, sg2_grasp_rotation
 from sg2_reach import ArmChain, arm_base_pose  # noqa: E402
 
 SIDES = ("l", "r")
+# where an arm waits during the other arm's one-hand move: out on its own side, in front of the
+# torso (|x| from the center, y ahead of arm_base_link, z above the table); IK error ~4 mm
+PARK = (0.35, 0.35, 0.18)
 
 
 class SG2Arms:
@@ -92,8 +95,13 @@ class SG2Arms:
             stats[s].pop("_qs")
         return reached, order, stats, joints
 
-    def approach(self, grasp_points, order, phase, hover=0.05, step=0.03):
-        """Move each arm (cloth untouched) from its TCP to above its grasp point and down onto it."""
+    def park(self, side):
+        return np.array([PARK[0] * (-1 if side == "l" else 1), self.base_y + PARK[1], PARK[2]])
+
+    def approach(self, grasp_points, order, phase, hover=0.05, step=0.03, transit=0.12):
+        """Move each arm (cloth untouched) from its TCP up to `transit` above the table, over its grasp
+        point and down onto it. In a one-hand move the idle arm goes up and out to its park pose,
+        clear of the working arm (the IK has no collision term)."""
         if not self.ready:  # episode start: put the arms in a ready pose above their first grasp
             for k, side in enumerate(order):
                 if np.isnan(grasp_points[k]).any():
@@ -102,16 +110,27 @@ class SG2Arms:
                 self.q[side] = PostureIK(self.iks[side].chain, max_step=10.0, iters=300).solve(
                     self.base, above, self.iks[side].q_ref)[0]
             self.ready = True
+        def polyline(points):
+            out = [points[0][None]]
+            for a, b in zip(points[:-1], points[1:]):
+                n = max(1, math.ceil(np.linalg.norm(b - a) / step))
+                out.append(a + (b - a) * np.linspace(0, 1, n + 1)[1:, None])
+            return np.vstack(out)
+
         paths = []
         for k, side in enumerate(order):
-            if np.isnan(grasp_points[k]).any():  # idle arm in a one-hand move
-                paths.append(np.full((2, 3), np.nan))
+            start = self.tcp(side)
+            if np.isnan(grasp_points[k]).any():  # idle arm in a one-hand move: park it
+                goal = self.park(side)
+                if np.linalg.norm(goal - start) < 0.01:
+                    paths.append(np.full((2, 3), np.nan))
+                    continue
+                z = max(start[2], goal[2])
+                paths.append(polyline([start, np.array([*start[:2], z]), goal]))
                 continue
-            start, goal = self.tcp(side), grasp_points[k]
-            above = goal + [0.0, 0.0, hover]
-            a = np.linspace(0, 1, max(2, math.ceil(np.linalg.norm(above - start) / step) + 1))[:, None]
-            b = np.linspace(0, 1, max(2, math.ceil(hover / step) + 1))[:, None]
-            paths.append(np.vstack([start + (above - start) * a, (above + (goal - above) * b)[1:]]))
+            goal = grasp_points[k]
+            z = max(start[2], goal[2] + hover, transit)
+            paths.append(polyline([start, np.array([*start[:2], z]), np.array([*goal[:2], z]), goal]))
         n = max(len(p) for p in paths)
         wps = np.stack([np.vstack([p, np.repeat(p[-1:], n - len(p), axis=0)]) for p in paths], axis=1)
         return self.realize(wps, phase, order)
