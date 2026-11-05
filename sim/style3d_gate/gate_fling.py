@@ -177,37 +177,66 @@ class ClothSim:
         self.args = args
         self.dt = args.sim_dt
         builder = newton.ModelBuilder(up_axis=newton.Axis.Z)
-        newton.solvers.SolverStyle3D.register_custom_attributes(builder)
-        k, kb = args.stretch_ke, args.bend_ke
-        style3d.add_cloth_mesh(
-            builder,
-            pos=wp.vec3(*pos),
-            rot=wp.quat(*rot),
-            vel=wp.vec3(0.0, 0.0, 0.0),
-            vertices=verts.tolist(),
-            indices=faces.flatten().tolist(),
-            panel_verts=panel.tolist(),
-            panel_indices=panel_idx.tolist(),
-            density=args.density,
-            tri_aniso_ke=wp.vec3(k, k, k * args.shear_ratio),
-            edge_aniso_ke=wp.vec3(kb, kb, kb),
-            particle_radius=args.contact_radius,
-        )
+        if args.solver == "style3d":
+            newton.solvers.SolverStyle3D.register_custom_attributes(builder)
+            k, kb = args.stretch_ke, args.bend_ke
+            style3d.add_cloth_mesh(
+                builder,
+                pos=wp.vec3(*pos),
+                rot=wp.quat(*rot),
+                vel=wp.vec3(0.0, 0.0, 0.0),
+                vertices=verts.tolist(),
+                indices=faces.flatten().tolist(),
+                panel_verts=panel.tolist(),
+                panel_indices=panel_idx.tolist(),
+                density=args.density,
+                tri_aniso_ke=wp.vec3(k, k, k * args.shear_ratio),
+                edge_aniso_ke=wp.vec3(kb, kb, kb),
+                particle_radius=args.contact_radius,
+            )
+        else:  # VBD: StVK membrane + dihedral bending; rest shape is the 3D mesh itself
+            builder.add_cloth_mesh(
+                pos=wp.vec3(*pos),
+                rot=wp.quat(*rot),
+                scale=1.0,
+                vel=wp.vec3(0.0, 0.0, 0.0),
+                vertices=verts.tolist(),
+                indices=faces.flatten().tolist(),
+                density=args.density,
+                tri_ke=args.vbd_tri_ke,
+                tri_ka=args.vbd_tri_ka,
+                tri_kd=args.vbd_tri_kd,
+                edge_ke=args.vbd_edge_ke,
+                edge_kd=args.vbd_edge_kd,
+                particle_radius=args.contact_radius,
+            )
         builder.add_ground_plane()
+        if args.solver == "vbd":
+            builder.color()  # VBD solves vertices color by color
         self.model = builder.finalize(device=args.device)
         self.model.soft_contact_ke = args.table_ke
         self.model.soft_contact_kd = args.table_kd
-        self.model.soft_contact_mu = args.table_mu
+        # VBD uses this one coefficient for both cloth-table and cloth-cloth friction
+        self.model.soft_contact_mu = args.table_mu if args.solver == "style3d" else args.vbd_mu
         self.model.set_gravity((0.0, 0.0, -9.81))
 
-        self.solver = newton.solvers.SolverStyle3D(
-            model=self.model, iterations=args.iterations, linear_iterations=args.linear_iterations
-        )
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
         self.control = self.model.control()
-        self.solver.collision.radius = args.contact_radius
-        self.solver.rebuild_bvh(self.state_0)
+        if args.solver == "style3d":
+            self.solver = newton.solvers.SolverStyle3D(
+                model=self.model, iterations=args.iterations, linear_iterations=args.linear_iterations
+            )
+            self.solver.collision.radius = args.contact_radius
+            self.solver.rebuild_bvh(self.state_0)
+        else:
+            self.solver = newton.solvers.SolverVBD(
+                self.model,
+                iterations=args.iterations,
+                particle_enable_self_contact=True,
+                particle_self_contact_margin=2 * args.contact_radius,  # same 3 mm thickness as Style3D
+                particle_self_contact_gap=args.contact_radius,
+            )
         self.pipeline = newton.CollisionPipeline(self.model)
         self.contacts = self.pipeline.contacts()
 
@@ -544,6 +573,15 @@ def make_parser(description: str) -> argparse.ArgumentParser:
     p.add_argument("--grasp-rest-radius", type=float, default=0.08,
                    help="only pin vertices within this rest-shape distance of the grasp anchor (FoldNet++ 8 cm)")
     p.add_argument("--release-settle", type=float, default=1.0)
+    # VBD alternative (has cloth-cloth friction; Style3D does not). Material units differ from Style3D.
+    p.add_argument("--solver", choices=["style3d", "vbd"], default="style3d")
+    p.add_argument("--vbd-tri-ke", type=float, default=1e2, help="VBD membrane shear stiffness")
+    p.add_argument("--vbd-tri-ka", type=float, default=1e2, help="VBD membrane area stiffness")
+    p.add_argument("--vbd-tri-kd", type=float, default=1e-6)
+    p.add_argument("--vbd-edge-ke", type=float, default=1e-5, help="VBD bending stiffness")
+    p.add_argument("--vbd-edge-kd", type=float, default=1e-7)
+    p.add_argument("--vbd-mu", type=float, default=0.7,
+                   help="VBD friction, shared by cloth-table and cloth-cloth (FoldNet++: 0.5 and 1.0)")
     return p
 
 
