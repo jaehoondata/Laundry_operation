@@ -31,6 +31,16 @@ def resolve_mesh_uris(xml: str, ros_install: Path = ROS_INSTALL) -> str:
     return re.sub(r"file:///root/ros2_ws/install/", f"{ros_install}/", xml)
 
 
+def strip_markers(xml: str) -> str:
+    """Drop the red TCP marker boxes on end_effector_{l,r}_link (URDF debug visuals, not on the robot)."""
+    root = ET.fromstring(xml)
+    for link in root.findall("link"):
+        if link.get("name", "").startswith("end_effector_"):
+            for el in link.findall("visual") + link.findall("collision"):
+                link.remove(el)
+    return ET.tostring(root, encoding="unicode")
+
+
 def strip_geometry(xml: str) -> str:
     """Drop visual/collision elements (kinematics-only model, no mesh loading)."""
     root = ET.fromstring(xml)
@@ -44,8 +54,7 @@ def strip_geometry(xml: str) -> str:
 def add_sg2(builder: newton.ModelBuilder, xform=None, with_geometry: bool = False, urdf: Path = URDF):
     """Add a fixed-base SG2 (base_link at `xform`). Returns the builder's joint/body count before adding."""
     xml = resolve_mesh_uris(urdf.read_text())
-    if not with_geometry:
-        xml = strip_geometry(xml)
+    xml = strip_geometry(xml) if not with_geometry else strip_markers(xml)
     builder.add_urdf(xml, xform=xform, floating=False, enable_self_collisions=False)
 
 
