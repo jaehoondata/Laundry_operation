@@ -93,6 +93,18 @@ class SG2Arms:
             out.append((t, w @ refs))
         return out
 
+    def reachable(self, side, pos, tol=0.01, tries=6) -> bool:
+        """Can that hand's TCP get within `tol` of `pos` with the grasp orientation the prior gives
+        there? IK from the prior's reference posture, a few restarts from where the last one ended."""
+        ik = self.iks[side]
+        target = self.target(side, pos)
+        q = np.clip(np.asarray(target[1], dtype=float), ik.chain.lower, ik.chain.upper)
+        for _ in range(tries):
+            q, _ok, _, _ = self.solve(ik, side, pos, q, target)
+            if np.linalg.norm(ik.chain.fk(q, self.base)[0][:3, 3] - pos) < tol:
+                return True
+        return False
+
     def tcp(self, side, q=None):
         return self.iks[side].chain.fk(self.q[side] if q is None else q, self.base)[0][:3, 3]
 

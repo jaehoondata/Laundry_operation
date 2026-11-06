@@ -182,11 +182,40 @@ class FoldEpisode:
         q = self.sim.q()
         return max(self.kp[name], key=lambda i: q[i, 2])
 
-    def sleeve_cuff(self, hand: str) -> int:
-        """Top-layer vertex at the middle of the sleeve cuff on the robot's `hand` side (l = -x)."""
+    def sleeve_cuff(self, hand: str, near=None) -> int:
+        """Top-layer vertex on the sleeve cuff on the robot's `hand` side (l = -x). The real wrist
+        cameras show the hand taking a cuff corner: by default the corner nearest that arm's
+        shoulder (--sleeve-point reach); `corner` takes the one nearest `near` (the real close
+        point, which on the right is often the far, unreachable corner), `middle` the cuff middle."""
         q = self.sim.q()
         side = sorted("lr", key=lambda k: q[self.top(f"{k}_armpit"), 0])["lr".index(hand)]
-        tip = (q[self.top(f"{side}_sleeve_top")] + q[self.top(f"{side}_sleeve_bottom")]) / 2
+        corners = [q[self.top(f"{side}_sleeve_{e}")] for e in ("top", "bottom")]
+        mode = self.args.sleeve_point
+        if mode == "middle" or (mode == "corner" and near is None):
+            tip = (corners[0] + corners[1]) / 2
+        elif mode == "corner":
+            tip = min(corners, key=lambda c: np.linalg.norm(c[:2] - np.asarray(near)[:2]))
+        elif mode == "reachable" and near is not None and self.robot is not None:
+            # the sleeve vertex nearest the real close point that this arm can actually reach
+            rest = self.sim.rest
+            cx = np.median(rest[:, 0])
+            half = np.abs(rest[:, 0] - cx).max()
+            sign = 1.0 if q[self.top(f"{side}_armpit"), 0] > np.median(q[:, 0]) else -1.0
+            sleeve = np.nonzero(np.abs(rest[:, 0] - cx) > 0.62 * half)[0]
+            sleeve = sleeve[np.sign(q[sleeve, 0] - np.median(q[:, 0])) == sign]
+            order = sleeve[np.argsort(np.linalg.norm(q[sleeve, :2] - np.asarray(near)[:2], axis=1))]
+            dz = np.array([0.0, 0.0, self.args.grip_dz])
+            for v in order[::max(1, len(order) // 40)]:
+                if self.robot.reachable(hand, q[v] + dz):
+                    self.log.setdefault("sleeve_pick", []).append(
+                        {"hand": hand, "off_real_cm": round(float(100 * np.linalg.norm(q[v, :2] - np.asarray(near)[:2])), 1)})
+                    return self.top_near(q[v, :2])
+            return self.top_near(np.asarray(near)[:2])
+        else:  # reach: the corner nearest that arm's shoulder, which the arm can best get to
+            from sg2_ik import SHOULDER_X
+
+            shoulder = np.array([SHOULDER_X[hand], self.args.robot_base_y])
+            tip = min(corners, key=lambda c: np.linalg.norm(c[:2] - shoulder))
         return self.top_near(tip[:2])
 
     def top_near(self, xy) -> int:
@@ -521,7 +550,7 @@ class FoldEpisode:
             for x in sides:
                 h = step[x]
                 cp, op = np.array(h["close_p"]), np.array(h["open_p"])
-                anchor = self.sleeve_cuff(x) if name in ("side_l", "side_r") and a.side_grasp == "sleeve" \
+                anchor = self.sleeve_cuff(x, cp) if name in ("side_l", "side_r") and a.side_grasp == "sleeve" \
                     else self.top_near(cp[:2])
                 misses[f"{name}_{x}"] = round(float(100 * np.linalg.norm(sim.q()[anchor, :2] - cp[:2])), 1)
                 anchors.append(anchor)
@@ -632,6 +661,9 @@ class FoldEpisode:
         self.log["phases"].append({"name": "retract", "t": self.sim.t, "coverage": self.coverage()})
 
 
+GRASP_REACH_TOL = 0.02  # [m] IK tracking error beyond which a grasp or carry is not physical
+
+
 def verdict(log) -> tuple[list[str], list[str]]:
     fails, warns = [], []
     if "diverged" in log:
@@ -647,6 +679,12 @@ def verdict(log) -> tuple[list[str], list[str]]:
             warns.append(f"{p['name']}: footprint grew {100 * (p['springback'] - 1):.0f}% after release")
         if max(p.get("place_err", [0])) > 0.04:
             warns.append(f"{p['name']}: placement error {100 * max(p['place_err']):.1f} cm")
+        for stage, arms in p.get("robot", {}).items():  # the hand must really be at the cloth it holds
+            if stage in ("approach", "carry"):
+                for arm, r in arms.items():
+                    if isinstance(r, dict) and r.get("track_err_max", 0.0) > GRASP_REACH_TOL:
+                        fails.append(f"{p['name']}: {arm} hand {100 * r['track_err_max']:.1f} cm off its "
+                                     f"{stage} target (out of reach)")
     c = log.get("arm_clearance")
     if c:
         if c["arm_arm_min"] < c["limit"]:
@@ -752,7 +790,10 @@ def main():
     # sleeves and 0.70 m hem to collar, centered at x 0, with the hem where the operators grasp it
     p.add_argument("--hem-y", type=float, default=-0.20, help="teleop: hem position (y) of the flat shirt")
     p.add_argument("--shirt-x", type=float, default=0.0, help="teleop: shirt center x")
-    p.add_argument("--teleop-width", type=float, default=0.94, help="teleop: widen the shirt by this factor")
+    p.add_argument("--teleop-width", type=float, default=0.80,
+                   help="teleop: scale the shirt's width by this factor (with --teleop-scale 0.97 the FoldNet mesh "
+                        "measures length 76.3 / chest 54.1 / shoulder 52.7 / sleeve 20.8 cm; the real shirt, size "
+                        "M/95, is 76 / 54 / 48 / 24 cm, and the mesh's proportions cannot match all four)")
     p.add_argument("--teleop-scale-jitter", type=float, default=0.05, help="teleop: per-trial size factor 1 +- this")
     p.add_argument("--no-replay", dest="replay", action="store_false",
                    help="teleop: the averaged scripted fold instead of replaying real episodes' steps")
@@ -762,6 +803,10 @@ def main():
     p.add_argument("--side-grasp", choices=["sleeve", "real"], default="sleeve",
                    help="teleop replay side steps: take the sleeve cuff (what the real wrist cameras show) or "
                         "the cloth nearest to the real close point")
+    p.add_argument("--sleeve-point", choices=["reachable", "reach", "corner", "middle"], default="reach",
+                   help="teleop replay side steps: the sleeve point nearest the real close point that the arm "
+                        "can reach (reachable, IK-checked), the cuff corner nearest the arm's shoulder (reach), "
+                        "nearest the real close point (corner), or the cuff middle")
     p.add_argument("--stop-after", choices=["half", "side_l", "side_r"], default=None,
                    help="teleop replay: end after this step (quick tests of one fold)")
     p.add_argument("--no-real-timing", dest="real_timing", action="store_false",
@@ -774,7 +819,9 @@ def main():
                         "has ~1.5 cm vertex spacing, so a 1x box often pinched a single vertex)")
     p.add_argument("--grip-dz", type=float, default=0.03,
                    help="robot hand (TCP) height above the cloth point it pinches [m] (real TCP at grasps: 0.03-0.04)")
-    p.add_argument("--teleop-scale", type=float, default=0.83, help="teleop: shirt size (geo-mean of bbox length/width)")
+    p.add_argument("--teleop-scale", type=float, default=0.97,
+                   help="teleop: shirt size (geo-mean of the mesh bbox), fitted with --teleop-width to the real "
+                        "shirt's size chart (M/95: length 76, chest 54 cm)")
     p.add_argument("--half-peak", type=float, default=0.40, help="teleop: hand peak height in the hem fold [m]")
     p.add_argument("--side-peak", type=float, default=0.18, help="teleop: hand peak height in the side folds [m]")
     p.add_argument("--half2-peak", type=float, default=0.20, help="teleop: hand peak height in the last fold [m]")
