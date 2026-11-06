@@ -198,9 +198,11 @@ def check(robot, states, stride):
         out["lr"].append(cKDTree(pts["r"]).query(pts["l"])[0].min())
         out["l_body"].append(body_tree.query(pts["l"])[0].min())
         out["r_body"].append(body_tree.query(pts["r"])[0].min())
-        # penetration: left vertices inside right links' hulls (in each link's own frame), and vice versa
+        # penetration: left vertices inside right links' hulls (in each link's own frame), and vice versa.
+        # Skipped while the arms' closest vertices are over 3 cm apart (a vertex inside the other
+        # arm would sit closer than that to its surface samples); this loop is ~95% of the run time.
         depth = 0.0
-        for a, b in (("l", "r"), ("r", "l")):
+        for a, b in ((("l", "r"), ("r", "l")) if out["lr"][-1] < 0.03 else ()):
             for n in sides[b]:
                 t = robot.link_pose(n, q, cache)
                 local = (pts[a] - t[:3, 3]) @ t[:3, :3]
