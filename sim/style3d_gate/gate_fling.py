@@ -210,7 +210,8 @@ class ClothSim:
                 edge_kd=args.vbd_edge_kd,
                 particle_radius=args.contact_radius,
             )
-        builder.add_ground_plane()
+        ground = newton.ModelBuilder.ShapeConfig(mu=args.ground_mu) if hasattr(newton.ModelBuilder, "ShapeConfig") else None
+        builder.add_ground_plane(cfg=ground)
         if args.solver == "vbd":
             builder.color()  # VBD solves vertices color by color
         self.model = builder.finalize(device=args.device)
@@ -250,7 +251,7 @@ class ClothSim:
         self.frames, self.frame_t, self.frame_phase, self.frame_pickers = [], [], [], []
         # robot state per recorded frame (fold_test --robot); NaN / False when no robot is driven
         self.cur_joint = np.full((2, 7), np.nan)  # arm joints, (l, r)
-        self.cur_grip = np.zeros(2, dtype=bool)  # gripper closed, (l, r)
+        self.cur_grip = np.zeros(2)  # gripper closure 0 open .. 1 closed, (l, r)
         self.frame_joint, self.frame_grip = [], []
         self.next_record = 0.0
         self.phase = "init"
@@ -262,13 +263,15 @@ class ClothSim:
     def qd(self) -> np.ndarray:
         return self.state_0.particle_qd.numpy().astype(np.float64)
 
-    def grasp(self, picker_pos: np.ndarray, must_include: list[int]) -> dict:
+    def grasp(self, picker_pos: np.ndarray, must_include: list[int], rest_radius: float | None = None) -> dict:
         """Pin vertices inside each picker box (top-down grasp) to that picker.
 
-        Vertices farther than --grasp-rest-radius from the anchor in the rest shape are left
-        free: otherwise a picker over a crumpled spot clamps distant cloth regions together and
-        spreading the pickers stretches the cloth between them.
+        Vertices farther than --grasp-rest-radius (or `rest_radius`) from the anchor in the rest shape
+        are left free: otherwise a picker over a crumpled spot clamps distant cloth regions together
+        and spreading the pickers stretches the cloth between them. A large `rest_radius` pinches
+        every layer under the picker, as fingers closing on the edge of a folded stack do.
         """
+        rest_radius = self.args.grasp_rest_radius if rest_radius is None else rest_radius
         q = self.q()
         idx, off, own = [], [], []
         info = {"pinned": [], "dropped_far": [], "manipulable": []}
@@ -282,14 +285,15 @@ class ClothSim:
             d = q - p
             # FoldNet++ EEF approaches along -z (checked on Galbot grasps), so for a top-down grasp
             # EEF z points up and the box z range maps to world dz directly
+            box_xy = PICKER_BOX[:2, 1] * getattr(self.args, "picker_scale", 1.0)
             inside = (
-                (np.abs(d[:, 0]) <= PICKER_BOX[0, 1])
-                & (np.abs(d[:, 1]) <= PICKER_BOX[1, 1])
+                (np.abs(d[:, 0]) <= box_xy[0])
+                & (np.abs(d[:, 1]) <= box_xy[1])
                 & (d[:, 2] >= PICKER_BOX[2, 0])
                 & (d[:, 2] <= PICKER_BOX[2, 1])
             )
             rest_d = np.linalg.norm(self.rest - self.rest[anchor], axis=1)
-            near = rest_d <= self.args.grasp_rest_radius
+            near = rest_d <= rest_radius
             sel = (set(np.nonzero(inside & near)[0].tolist()) | {anchor}) - set(idx)
             idx += sorted(sel)
             off += [q[i] - p for i in sorted(sel)]
@@ -357,6 +361,18 @@ class ClothSim:
         self.phase = phase
         for _ in range(int(round(duration / self.dt))):
             self.substep()
+
+    def ramp_grip(self, target, stroke_time: float, phase: str) -> float:
+        """Move the grippers linearly to `target` (0 open .. 1 closed, per arm) at one full stroke per
+        stroke_time seconds while the cloth keeps simulating. Returns the time taken."""
+        self.phase = phase
+        start, target = self.cur_grip.copy(), np.asarray(target, dtype=float)
+        n = int(round(float(np.abs(target - start).max()) * stroke_time / self.dt))
+        for s in range(n):
+            self.cur_grip = start + (target - start) * (s + 1) / n
+            self.substep()
+        self.cur_grip = target.copy()
+        return n * self.dt
 
     def follow(self, waypoints: np.ndarray, phase: str, step_dt: float = ACTION_DT, joints=None):
         """Track picker waypoints [N+1, 2, 3] spaced step_dt apart (piecewise linear).
@@ -577,7 +593,9 @@ def make_parser(description: str) -> argparse.ArgumentParser:
     p.add_argument("--stretch-ke", type=float, default=70.0)
     p.add_argument("--shear-ratio", type=float, default=1.0)
     p.add_argument("--bend-ke", type=float, default=7e-7)
-    p.add_argument("--table-mu", type=float, default=0.5)
+    p.add_argument("--table-mu", type=float, default=0.5,
+                   help="cloth friction; Style3D uses sqrt(table_mu * ground_mu) against the table")
+    p.add_argument("--ground-mu", type=float, default=1.0, help="table (ground plane) material friction")
     p.add_argument("--table-ke", type=float, default=1e3,
                    help="table contact stiffness; Newton's example value 1e1 let pressed cloth sink 1-3 cm")
     p.add_argument("--table-kd", type=float, default=1e-5)

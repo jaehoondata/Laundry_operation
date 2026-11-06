@@ -133,14 +133,52 @@ def clearance(joint, grip, record_dt, check_dt=0.2):
 
 
 def load_states(path: Path):
-    """[(episode name, states[N,16])]"""
+    """[(episode name, states[N,16], phases[N] or None)]"""
     if (path / "frames.npz").exists():
         d = np.load(path / "frames.npz")
-        return [(path.name, states_from_frames(d["joint"], d["grip"]))]
+        return [(path.name, states_from_frames(d["joint"], d["grip"]), d["phase"])]
     import pandas as pd
 
     df = pd.concat([pd.read_parquet(f) for f in sorted(glob.glob(str(path / "data/*/*.parquet")))])
-    return [(f"episode {e}", np.stack(g["observation.state"].values)) for e, g in df.groupby("episode_index")]
+    return [(f"episode {e}", np.stack(g["observation.state"].values), None) for e, g in df.groupby("episode_index")]
+
+
+def closest_pairs(robot, q16, n=3):
+    """The n closest (left part, right part or torso, distance) at one joint state."""
+    q, cache = q_dict(q16), {}
+    world = {}
+    for name in robot.side_links("l") + robot.side_links("r") + BODY_LINKS:
+        t = robot.link_pose(name, q, cache)
+        world[name] = robot.meshes[name] @ t[:3, :3].T + t[:3, 3]
+    pairs = []
+    for a in robot.side_links("l"):
+        tree = cKDTree(world[a])
+        for b in robot.side_links("r") + BODY_LINKS:
+            pairs.append((a, b, float(tree.query(world[b])[0].min())))
+    for a in robot.side_links("r"):
+        tree = cKDTree(world[a])
+        for b in BODY_LINKS:
+            pairs.append((a, b, float(tree.query(world[b])[0].min())))
+    return sorted(pairs, key=lambda x: x[2])[:n]
+
+
+def report_phases(robot, name, states, phases, stride, limit):
+    """Per phase: closest arm-arm / arm-torso distance, and the closest parts where under `limit`."""
+    r = check(robot, states, stride)
+    idx = np.arange(0, len(states), stride)
+    lr = np.where(r["depth"] > 0, 0.0, r["lr"])
+    body = np.minimum(r["l_body"], r["r_body"])
+    print(f"{name}")
+    for ph in dict.fromkeys(phases[idx]):
+        m = phases[idx] == ph
+        i_lr, i_b = np.argmin(np.where(m, lr, np.inf)), np.argmin(np.where(m, body, np.inf))
+        flag = " <--" if min(lr[i_lr], body[i_b]) < limit else ""
+        print(f"  {ph:<18} arm-arm {1000 * lr[i_lr]:6.1f} mm (surface {1000 * r['lr'][m].min():5.1f} mm, "
+              f"hull depth {1000 * r['depth'][m].max():4.1f} mm)  arm-torso {1000 * body[i_b]:6.1f} mm{flag}")
+        if flag:
+            worst = idx[i_lr] if lr[i_lr] <= body[i_b] else idx[i_b]
+            for a, b, d in closest_pairs(robot, states[worst]):
+                print(f"      frame {worst}: {a} - {b} {1000 * d:.1f} mm")
 
 
 def check(robot, states, stride):
@@ -179,11 +217,18 @@ def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("paths", nargs="+", type=Path)
     p.add_argument("--stride", type=int, default=3, help="check every Nth frame")
+    p.add_argument("--phases", action="store_true", help="trial dirs: break down by phase and name the closest parts")
+    p.add_argument("--limit", type=float, default=0.01, help="flag phases closer than this [m] (--phases)")
     args = p.parse_args()
     robot = Robot()
+    if args.phases:
+        for path in args.paths:
+            for name, st, ph in load_states(path):
+                report_phases(robot, name, st, ph, args.stride, args.limit)
+        return
     print(f"{'episode':<24} {'frames':>6} {'L-R min':>8} {'L-R<5mm':>8} {'depth max':>9} {'L-body':>7} {'R-body':>7}")
     for path in args.paths:
-        for name, st in load_states(path):
+        for name, st, _ in load_states(path):
             r = check(robot, st, args.stride)
             touch = (r["lr"] < CONTACT) | (r["depth"] > 0)
             print(f"{name:<24} {len(st):6d} {1000 * r['lr'].min():6.1f}mm {100 * touch.mean():7.1f}% "
