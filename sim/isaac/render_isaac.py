@@ -47,6 +47,14 @@ p.add_argument("--rect-size", type=float, default=1.5)
 p.add_argument("--rect-height", type=float, default=1.8, help="rect light height above the table [m]")
 p.add_argument("--rt-subframes", type=int, default=4)
 p.add_argument("--normals", action="store_true", help="author smooth vertex normals on the cloth")
+p.add_argument("--cloth-subdiv", type=int, default=0,
+               help="Loop-subdivide the cloth mesh this many times before rendering (smooth folds and edges)")
+p.add_argument("--cloth-texture", type=Path, default=None,
+               help="cloth colour image (sim/isaac/cloth_texture.py) with --cloth-uv per simulated vertex")
+p.add_argument("--cloth-uv", type=Path, default=None)
+p.add_argument("--cloth-shell", type=float, default=0.0,
+               help="render the cloth as a closed shell this thick [m] (two offset sides + rim) with smooth "
+                    "normals, so each side shades correctly from its own side (0: the single-layer mesh)")
 p.add_argument("--renderer", default="RayTracedLighting", choices=["RayTracedLighting", "PathTracing"])
 args, _ = p.parse_known_args()
 
@@ -156,6 +164,61 @@ def vertex_normals(v, f):
     return n / (np.linalg.norm(n, axis=1, keepdims=True) + 1e-12)
 
 
+def loop_setup(faces, nv):
+    """One Loop subdivision step as a fixed linear map: (new faces, rows, cols, weights, new vertex count)
+    with new_v[rows] += weights * v[cols]. Edges with other than two faces use the boundary rules."""
+    f = np.asarray(faces, dtype=np.int64)
+    e = np.sort(np.concatenate([f[:, [0, 1]], f[:, [1, 2]], f[:, [2, 0]]]), axis=1)
+    opp = np.concatenate([f[:, 2], f[:, 0], f[:, 1]])
+    edges, inv, cnt = np.unique(e, axis=0, return_inverse=True, return_counts=True)
+    inv = inv.ravel()
+    ne = len(edges)
+    rows, cols, w = [], [], []
+    # odd (edge) vertices
+    inner = cnt == 2
+    for k in (0, 1):
+        rows.append(nv + np.arange(ne)); cols.append(edges[:, k]); w.append(np.where(inner, 3 / 8, 1 / 2))
+    order = np.argsort(inv, kind="stable")
+    first = np.searchsorted(inv[order], np.arange(ne))
+    for j in (0, 1):  # the two opposite vertices of interior edges
+        idx = order[np.minimum(first + j, len(order) - 1)]
+        rows.append(nv + np.flatnonzero(inner)); cols.append(opp[idx][inner]); w.append(np.full(inner.sum(), 1 / 8))
+    # even (original) vertices
+    bnd = edges[~inner]
+    deg = np.bincount(edges.ravel(), minlength=nv)
+    bdeg = np.bincount(bnd.ravel(), minlength=nv)
+    on_b = bdeg > 0
+    beta = np.where(deg > 3, 3 / (8 * np.maximum(deg, 1)), 3 / 16)
+    self_w = np.where(on_b, np.where(bdeg == 2, 3 / 4, 1.0), 1 - deg * beta)
+    rows.append(np.arange(nv)); cols.append(np.arange(nv)); w.append(self_w)
+    for a, b in ((0, 1), (1, 0)):
+        rows.append(edges[:, a]); cols.append(edges[:, b])
+        w.append(np.where(on_b[edges[:, a]], 0.0, beta[edges[:, a]]))
+        rows.append(bnd[:, a]); cols.append(bnd[:, b]); w.append(np.where(bdeg[bnd[:, a]] == 2, 1 / 8, 0.0))
+    m = nv + inv.reshape(3, -1)  # midpoint of edges (0,1), (1,2), (2,0) per face
+    ab, bc, ca = m
+    new = np.concatenate([np.c_[f[:, 0], ab, ca], np.c_[ab, f[:, 1], bc], np.c_[ca, bc, f[:, 2]], np.c_[ab, bc, ca]])
+    rows, cols, w = (np.concatenate(x) for x in (rows, cols, w))
+    keep = w != 0
+    return new, rows[keep], cols[keep], w[keep], nv + ne
+
+
+def apply_map(v, rows, cols, w, n):
+    return np.stack([np.bincount(rows, weights=w * v[cols, k], minlength=n) for k in range(v.shape[1])], axis=1)
+
+
+def shell_setup(faces, nv):
+    """Faces of a closed shell around a single-layer mesh: the mesh offset to one side (0..nv-1), the
+    other side flipped (nv..2nv-1), and a rim of quads along the boundary edges joining them."""
+    f = np.asarray(faces, dtype=np.int64)
+    e = np.concatenate([f[:, [0, 1]], f[:, [1, 2]], f[:, [2, 0]]])
+    key = np.sort(e, axis=1)
+    _, inv, cnt = np.unique(key, axis=0, return_inverse=True, return_counts=True)
+    b = e[cnt[inv.ravel()] == 1]  # boundary edges in face winding order
+    rim = np.concatenate([np.c_[b[:, 1], b[:, 0], b[:, 0] + nv], np.c_[b[:, 1], b[:, 0] + nv, b[:, 1] + nv]])
+    return np.concatenate([f, f[:, ::-1] + nv, rim])
+
+
 d = np.load(args.scene)
 stage = omni.usd.get_context().get_stage()
 UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
@@ -174,7 +237,40 @@ for k, n in enumerate(names):
 
 # cloth
 cloth_faces = d["cloth_faces"]
-cloth = mesh(stage, "/World/Cloth", d["cloth_q"][0], cloth_faces, mats["cloth"], double_sided=True)
+subdiv = []  # Loop maps, applied in order each frame
+nv = len(d["cloth_q"][0])
+for _ in range(args.cloth_subdiv):
+    cloth_faces, *mp, nv = loop_setup(cloth_faces, nv)
+    subdiv.append((*mp, nv))
+base_faces = cloth_faces
+if args.cloth_shell > 0:
+    cloth_faces = shell_setup(base_faces, nv)
+    args.normals = True
+
+
+def cloth_points(q):
+    """Cloth points to render for simulated vertices q (subdivided, and the shell's two sides)."""
+    for mp in subdiv:
+        q = apply_map(q, *mp)
+    if args.cloth_shell > 0:
+        n = vertex_normals(q, base_faces)
+        q = np.concatenate([q + n * args.cloth_shell / 2, q - n * args.cloth_shell / 2])
+    return q
+
+
+cloth_mat = mats["cloth"]
+if args.cloth_texture is not None:
+    cloth_mat = texture_material(stage, "/World/Looks/clothtex", args.cloth_texture.resolve(), roughness=0.85)
+cloth = mesh(stage, "/World/Cloth", cloth_points(d["cloth_q"][0]), cloth_faces, cloth_mat, double_sided=True)
+if args.cloth_uv is not None:
+    uv = np.load(args.cloth_uv).astype(np.float64)
+    for mp in subdiv:
+        uv = apply_map(uv, *mp)
+    if args.cloth_shell > 0:
+        uv = np.concatenate([uv, uv])
+    st = UsdGeom.PrimvarsAPI(cloth).CreatePrimvar("st", Sdf.ValueTypeNames.TexCoord2fArray, UsdGeom.Tokens.vertex)
+    st.Set(Vt.Vec2fArray.FromNumpy(np.ascontiguousarray(uv, dtype=np.float32)))
+print(f"cloth: {len(cloth_faces)} triangles (subdiv {args.cloth_subdiv}, shell {args.cloth_shell * 1000:.1f} mm)", flush=True)
 # authored vertex normals point one way through the single-layer cloth, so a folded-over flap (seen
 # from its back) shaded black; --normals keeps them, default lets RTX shade each side itself
 cloth_normals = cloth.CreateNormalsAttr() if args.normals else None
@@ -248,7 +344,7 @@ for k, i in enumerate(todo):
         set_matrix(op, d["link_T"][i, li])
     for ci, op in enumerate(cam_ops):
         set_matrix(op, d["cam_T"][i, ci])
-    q = d["cloth_q"][i]
+    q = cloth_points(d["cloth_q"][i].astype(np.float64))
     cloth.GetPointsAttr().Set(Vt.Vec3fArray.FromNumpy(np.ascontiguousarray(q, dtype=np.float32)))
     if cloth_normals is not None:
         cloth_normals.Set(Vt.Vec3fArray.FromNumpy(vertex_normals(q, cloth_faces).astype(np.float32)))

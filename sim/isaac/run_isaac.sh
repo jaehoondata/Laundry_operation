@@ -23,5 +23,5 @@ docker run --rm --gpus all --network=host \
     -v "$PWD":/work:rw \
     -v "${SG2_ROS_INSTALL:-$HOME/Desktop/jaehoon/sg2_ros}":/sg2_ros:ro \
     --entrypoint bash nvcr.io/nvidia/isaac-sim:4.5.0 \
-    -c "cd /work && /isaac-sim/python.sh \"\$0\" \"\$@\"; rc=\$?; chown -R $(id -u):$(id -g) /work/outputs/isaac /work/outputs/style3d_gate 2>/dev/null; exit \$rc" \
+    -c "cd /work && /isaac-sim/python.sh \"\$0\" \"\$@\"; rc=\$?; chown -R $(id -u):$(id -g) /work/outputs/isaac /work/outputs/style3d_gate /work/outputs/foldnetxx 2>/dev/null; exit \$rc" \
     "$script" "$@"
