@@ -13,7 +13,8 @@ eef_pose follows the real data exactly (fit on its parquet, 0.0 mm residual): li
 offset 8 cm along link7 -z, a fixed per-arm rotation, in a base frame 25.4 mm along +x from base_link.
 
 Input trial dirs need frames.npz from fold_test.py --robot --record-dt 0.0333 and the three mp4s
-from render_newton.py. Run in the lerobot061 env:
+from render_newton.py (or, with --video-dir isaac, from sim/isaac/render_trial.sh). Run in the
+lerobot061 env:
 
     python sim/sg2_newton/export_lerobot.py --repo-id <user>/<name> --root <dir> trial_dir [trial_dir ...]
     python sim/sg2_newton/export_lerobot.py --check-eef path/to/real/file-xxx.parquet   # validate eef_pose
@@ -99,7 +100,7 @@ def decode(mp4: Path):
         return [f.to_ndarray(format="rgb24") for f in c.decode(video=0)]
 
 
-def trial_frames(trial: Path, lead: int = ACTION_LEAD):
+def trial_frames(trial: Path, lead: int = ACTION_LEAD, video_dir: str = ""):
     d = np.load(trial / "frames.npz")
     if "joint" not in d:
         raise ValueError(f"{trial}: no robot joints (run fold_test.py with --robot)")
@@ -111,7 +112,7 @@ def trial_frames(trial: Path, lead: int = ACTION_LEAD):
     joint[: known[0]] = joint[known[0]]  # before the first robot move: hold its first pose
     grip = d["grip"].astype(float) * GRIPPER_CLOSED
     state = np.concatenate([joint[:, 0], joint[:, 1], grip], axis=1).astype(np.float32)
-    images = {cam: decode(trial / f"{cam}.mp4") for cam in CAMERAS}
+    images = {cam: decode(trial / video_dir / f"{cam}.mp4") for cam in CAMERAS}
     n = min(len(state), *(len(v) for v in images.values()))
     state = state[:n]
     action = state[np.minimum(np.arange(n) + lead, n - 1)]  # state `lead` frames on; the end holds
@@ -137,6 +138,8 @@ def main():
     p.add_argument("--include-failed", action="store_true", help="also export trials marked FAIL")
     p.add_argument("--action-lead", type=int, default=ACTION_LEAD,
                    help="action = joint state this many frames ahead (real teleop lag)")
+    p.add_argument("--video-dir", default="",
+                   help="read <trial>/<video-dir>/<camera>.mp4, e.g. 'isaac' for sim/isaac/render_trial.sh output")
     p.add_argument("--check-eef", type=Path, help="validate eef_pose against a real dataset parquet and exit")
     args = p.parse_args()
     if args.check_eef:
@@ -164,7 +167,7 @@ def main():
         if not args.include_failed and not trial_ok(trial):
             print(f"skip {trial} (FAIL in metrics.json)")
             continue
-        state, action, images = trial_frames(trial, args.action_lead)
+        state, action, images = trial_frames(trial, args.action_lead, args.video_dir)
         for i in range(len(state)):
             frame = {"task": args.task, "observation.state": state[i], "action": action[i],
                      "observation.eef_pose": fk(state[i]), "action.eef_pose": fk(action[i])}

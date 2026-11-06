@@ -32,21 +32,19 @@ import sg2_model  # noqa: E402
 from sg2_reach import arm_base_pose, homogeneous  # noqa: E402
 
 HEAD_TILT = 0.69  # head_joint1 in every teleop recording (Oct 2026)
-CAMERAS = {  # name: (URDF body, width, height, horizontal FOV deg, frame convention)
-    "head": ("zed_left_camera_optical_frame", 672, 376, 87.0, "optical"),
-    "wrist_left": ("camera_left_link", 424, 240, 87.0, "ros_link"),
-    "wrist_right": ("camera_right_link", 424, 240, 87.0, "ros_link"),
-}
+# name: (URDF body, width, height, horizontal FOV deg, frame convention, near) + head correction
+from camera_calib import CAMERAS, gl_rotation  # noqa: E402
 # rays start this far in front of the camera frame, past the camera's own housing mesh
 # (the head shell's front rim is still in view at 3 cm and gone from 5 cm; the D405 body ~5 mm)
-NEAR = {"head": 0.05, "wrist_left": 0.01, "wrist_right": 0.01}
-# ROS camera_link (x forward, y left, z up) -> optical (z forward, x right, y down)
-LINK_TO_OPTICAL = np.array([[0.0, 0.0, 1.0], [-1.0, 0.0, 0.0], [0.0, -1.0, 0.0]])
-# optical -> renderer camera frame (looks along -z, +y up)
-OPTICAL_TO_GL = np.diag([1.0, -1.0, -1.0])
-TABLE = {"depth": 0.75, "width": 1.6, "thickness": 0.04, "edge_from_base": 0.075}  # deploy table.xml (approx.)
-COLORS = {"table": (0.82, 0.71, 0.55), "floor": (0.45, 0.45, 0.45), "cloth": (0.20, 0.35, 0.70),
-          "camera": (0.15, 0.15, 0.17)}
+NEAR = {name: c[5] for name, c in CAMERAS.items()}
+# deploy table.xml (approx.); depth 0.86 puts the far edge where the real head camera sees it, and the
+# real table runs past both sides of the image
+TABLE = {"depth": 0.86, "width": 3.0, "thickness": 0.04, "edge_from_base": 0.075}
+# defaults follow the real recordings: white shirt, light wood table, a black partition right behind
+# the table; --cloth-color / --table-color / --wall-color change them (for visual variation)
+COLORS = {"table": (0.80, 0.66, 0.46), "floor": (0.45, 0.45, 0.45), "cloth": (0.90, 0.90, 0.90),
+          "wall": (0.04, 0.04, 0.04), "camera": (0.15, 0.15, 0.17)}
+WALL_HEIGHT = 1.2  # partition behind the table's far edge [m above the table top]
 
 
 def quat_from_matrix(m):
@@ -80,32 +78,39 @@ def base_link_pose(base_y, height):
     return arm_base_pose(base_y, height) @ np.linalg.inv(lift_origin_t)
 
 
-def build_scene(frames, args):
+def build_scene(frames, args, colors=COLORS):
     builder = newton.ModelBuilder(up_axis=newton.Axis.Z)
     base = base_link_pose(args.robot_base_y, args.robot_height)
     sg2_model.add_sg2(builder, xform=wp.transform(base[:3, 3], quat_from_matrix(base[:3, :3])), with_geometry=True)
     builder.add_cloth_mesh(
         pos=wp.vec3(0.0, 0.0, 0.0), rot=wp.quat_identity(), scale=1.0, vel=wp.vec3(0.0, 0.0, 0.0),
         vertices=frames["q"][0].tolist(), indices=frames["faces"].flatten().tolist(), density=0.2,
-        particle_radius=1e-3, color=COLORS["cloth"],
+        particle_radius=1e-3, color=colors["cloth"],
     )
     # table: top face at z=0 (the cloth sim's ground), robot-side edge just in front of base_link
     edge_y = base[1, 3] + TABLE["edge_from_base"]
+    depth, width = args.table_depth, args.table_width
     builder.add_shape_box(
-        -1, hx=TABLE["width"] / 2, hy=TABLE["depth"] / 2, hz=TABLE["thickness"] / 2,
-        xform=wp.transform((0.0, edge_y + TABLE["depth"] / 2, -TABLE["thickness"] / 2), wp.quat_identity()),
-        color=COLORS["table"],
+        -1, hx=width / 2, hy=depth / 2, hz=TABLE["thickness"] / 2,
+        xform=wp.transform((0.0, edge_y + depth / 2, -TABLE["thickness"] / 2), wp.quat_identity()),
+        color=colors["table"],
     )
-    builder.add_ground_plane(height=float(base[2, 3]), color=COLORS["floor"])
+    far_y = edge_y + depth
+    builder.add_shape_box(
+        -1, hx=width / 2 + 1.0, hy=0.01, hz=WALL_HEIGHT / 2,
+        xform=wp.transform((0.0, far_y + 0.01, WALL_HEIGHT / 2 - TABLE["thickness"]), wp.quat_identity()),
+        color=colors["wall"],
+    )
+    builder.add_ground_plane(height=float(base[2, 3]), color=colors["floor"])
     model = builder.finalize(device=args.device)
     # the URDF gives the D405 bodies a red material; the real cameras are dark gray
     bodies = sg2_model.body_index(model)
     cam_bodies = {bodies[n] for n in ("camera_left_link", "camera_right_link") if n in bodies}
-    colors, shape_body = model.shape_color.numpy(), model.shape_body.numpy()
-    for s in range(len(colors)):
+    shape_colors, shape_body = model.shape_color.numpy(), model.shape_body.numpy()
+    for s in range(len(shape_colors)):
         if shape_body[s] in cam_bodies:
-            colors[s] = COLORS["camera"]
-    model.shape_color.assign(colors)
+            shape_colors[s] = COLORS["camera"]
+    model.shape_color.assign(shape_colors)
     return model
 
 
@@ -117,14 +122,14 @@ def robot_joint_q(model, joint, grip):
     for k, side in enumerate("lr"):
         for j, name in enumerate(sg2_model.ARM_JOINTS[side]):
             q[qi[name]] = joint[k, j]
-        # teleop logs: gripper_joint1 is 0 open / 1.1 (its limit) closed on cloth, rarely in between
-        c = 1.0 if grip[k] else 0.0
+        # grip is the closure 0..1 (older recordings: bool); gripper_joint1 1.1 is fully closed
+        c = float(grip[k])
         for n, v in ((1, 1.1 * c), (2, 1.0 * c), (3, 1.1 * c), (4, 1.0 * c)):
             q[qi[f"gripper_{side}_joint{n}"]] = v
     return q
 
 
-def camera_transform(body_q_row, convention):
+def camera_transform(body_q_row, name):
     p, quat = body_q_row[:3], body_q_row[3:7]
     x, y, z, w = quat
     r = np.array([
@@ -132,10 +137,14 @@ def camera_transform(body_q_row, convention):
         [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
         [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
     ])
-    if convention == "ros_link":
-        r = r @ LINK_TO_OPTICAL
-    r = r @ OPTICAL_TO_GL
-    return wp.transformf(wp.vec3f(*p), wp.quatf(*quat_from_matrix(r)))
+    return wp.transformf(wp.vec3f(*p), wp.quatf(*quat_from_matrix(gl_rotation(name, r))))
+
+
+def rgb(text):
+    v = tuple(float(x) for x in text.split(","))
+    if len(v) != 3 or not all(0.0 <= x <= 1.0 for x in v):
+        raise argparse.ArgumentTypeError("three comma-separated values in 0..1")
+    return v
 
 
 def fill_missing_joints(joint):
@@ -155,6 +164,17 @@ def main():
     p.add_argument("--robot-height", type=float, default=0.55)
     p.add_argument("--max-frames", type=int, default=None)
     p.add_argument("--stills", type=int, default=6, help="also save this many evenly spaced PNG frames")
+    for k in ("cloth", "table", "wall"):
+        p.add_argument(f"--{k}-color", type=rgb, default=COLORS[k], help=f"{k} RGB in 0..1, e.g. 0.9,0.9,0.9")
+    p.add_argument("--table-depth", type=float, default=TABLE["depth"], help="table depth (robot to wall) [m]")
+    p.add_argument("--table-width", type=float, default=TABLE["width"], help="table width [m]")
+    p.add_argument("--only-stills", action="store_true", help="render only the --stills frames (no videos)")
+    p.add_argument("--light-dir", type=lambda t: tuple(float(x) for x in t.split(",")), default=(0.0, 0.3, -1.0),
+                   help="direction the light travels (default: from above, slightly behind the robot, like the "
+                        "lab's ceiling light; Newton's default -1,1,-1 left the cloth's wrinkles dark)")
+    p.add_argument("--no-ambient", action="store_true", help="disable ambient light")
+    p.add_argument("--shadows", action="store_true",
+                   help="cast shadows from the default light (the lab's diffuse ceiling light casts almost none)")
     args = p.parse_args()
 
     import imageio.v2 as imageio
@@ -168,46 +188,54 @@ def main():
     joints, grips = fill_missing_joints(frames["joint"]), frames["grip"]
     fps = 1.0 / float(np.median(np.diff(frames["t"])))
 
-    model = build_scene(frames, args)
+    model = build_scene(frames, args, {**COLORS, "cloth": args.cloth_color, "table": args.table_color,
+                                       "wall": args.wall_color})
     bodies = sg2_model.body_index(model)
     sensor = SensorCamera(model)
-    sensor.create_default_light(enable_shadows=True)
+    light = np.asarray(args.light_dir, dtype=float)
+    light /= np.linalg.norm(light)
+    sensor.create_default_light(enable_shadows=args.shadows, direction=wp.vec3f(*light))
     cfg = sensor.default_render_config
-    cfg.enable_shadows = True
+    cfg.enable_shadows = args.shadows
+    cfg.enable_ambient_lighting = not args.no_ambient
     cfg.enable_backface_culling = False  # single-layer cloth triangles must show both faces
     state = model.state()
 
     outs = {}
-    for name, (_body, w, h, hfov, _conv) in CAMERAS.items():
+    for name, (_body, w, h, hfov, _conv, _near) in CAMERAS.items():
         f = w / (2 * math.tan(math.radians(hfov) / 2))
         rays = sensor.compute_camera_rays_pinhole_opencv(w, h, f, f, w / 2, h / 2, device=model.device)
         r = rays.numpy()
         r[..., 0, :] = r[..., 1, :] * NEAR[name]  # origin = near-plane point along each ray
         rays.assign(r)
         img = sensor.allocate_image_color(1, w, h)
-        outs[name] = (rays, img, imageio.get_writer(args.trial_dir / f"{name}.mp4", fps=fps, macro_block_size=1), [])
+        writer = None if args.only_stills else imageio.get_writer(args.trial_dir / f"{name}.mp4", fps=fps,
+                                                                    macro_block_size=1)
+        outs[name] = (rays, img, writer, [])
     still_idx = set(np.linspace(0, n - 1, args.stills).astype(int).tolist()) if args.stills else set()
 
-    for i in range(n):
+    for i in (sorted(still_idx) if args.only_stills else range(n)):
         state.particle_q.assign(frames["q"][i])
         jq = wp.array(robot_joint_q(model, joints[i], grips[i]), dtype=float, device=model.device)
         newton.eval_fk(model, jq, model.joint_qd, state)
         model.bvh_refit_shapes(state)
         model.bvh_refit_particles(state)
         body_q = state.body_q.numpy()
-        for name, (body, w, h, _hfov, conv) in CAMERAS.items():
+        for name, (body, w, h, _hfov, _conv, _near) in CAMERAS.items():
             rays, img, writer, stills = outs[name]
-            xf = wp.array([camera_transform(body_q[bodies[body]], conv)], dtype=wp.transformf, device=model.device)
+            xf = wp.array([camera_transform(body_q[bodies[body]], name)], dtype=wp.transformf, device=model.device)
             sensor.update(state, xf, rays, color_image=img)
             rgba = img.numpy()[0].view(np.uint8).reshape(h, w, 4)
-            writer.append_data(rgba[..., :3])
+            if writer is not None:
+                writer.append_data(rgba[..., :3])
             if i in still_idx:
                 stills.append(rgba[..., :3].copy())
         if i % 50 == 0:
             print(f"frame {i}/{n} t={frames['t'][i]:.1f}s {frames['phase'][i]}", flush=True)
 
     for name, (_rays, _img, writer, stills) in outs.items():
-        writer.close()
+        if writer is not None:
+            writer.close()
         if stills:
             imageio.imwrite(args.trial_dir / f"{name}_stills.png", np.concatenate(stills, axis=1))
     print(f"wrote {', '.join(f'{c}.mp4' for c in CAMERAS)} ({n} frames, {fps:.1f} fps) to {args.trial_dir}")
