@@ -96,11 +96,12 @@ def build_scene(frames, args, colors=COLORS):
         color=colors["table"],
     )
     far_y = edge_y + depth
-    builder.add_shape_box(
-        -1, hx=width / 2 + 1.0, hy=0.01, hz=WALL_HEIGHT / 2,
-        xform=wp.transform((0.0, far_y + 0.01, WALL_HEIGHT / 2 - TABLE["thickness"]), wp.quat_identity()),
-        color=colors["wall"],
-    )
+    if getattr(args, "wall", True):
+        builder.add_shape_box(
+            -1, hx=width / 2 + 1.0, hy=0.01, hz=WALL_HEIGHT / 2,
+            xform=wp.transform((0.0, far_y + 0.01, WALL_HEIGHT / 2 - TABLE["thickness"]), wp.quat_identity()),
+            color=colors["wall"],
+        )
     builder.add_ground_plane(height=float(base[2, 3]), color=colors["floor"])
     model = builder.finalize(device=args.device)
     # the URDF gives the D405 bodies a red material; the real cameras are dark gray
@@ -140,6 +141,16 @@ def camera_transform(body_q_row, name):
     return wp.transformf(wp.vec3f(*p), wp.quatf(*quat_from_matrix(gl_rotation(name, r))))
 
 
+def look_at(eye, target):
+    """Fixed camera transform (GL convention: looks along -z, +y up) at eye, aimed at target, world z up."""
+    eye, target = np.asarray(eye, float), np.asarray(target, float)
+    fwd = (target - eye) / np.linalg.norm(target - eye)
+    right = np.cross(fwd, [0.0, 0.0, 1.0])
+    right /= np.linalg.norm(right)
+    r = np.stack([right, np.cross(right, fwd), -fwd], axis=1)
+    return wp.transformf(wp.vec3f(*eye), wp.quatf(*quat_from_matrix(r)))
+
+
 def rgb(text):
     v = tuple(float(x) for x in text.split(","))
     if len(v) != 3 or not all(0.0 <= x <= 1.0 for x in v):
@@ -168,6 +179,8 @@ def main():
         p.add_argument(f"--{k}-color", type=rgb, default=COLORS[k], help=f"{k} RGB in 0..1, e.g. 0.9,0.9,0.9")
     p.add_argument("--table-depth", type=float, default=TABLE["depth"], help="table depth (robot to wall) [m]")
     p.add_argument("--table-width", type=float, default=TABLE["width"], help="table width [m]")
+    p.add_argument("--no-wall", dest="wall", action="store_false",
+                   help="leave out the partition behind the table (for a --view camera placed beyond it)")
     p.add_argument("--only-stills", action="store_true", help="render only the --stills frames (no videos)")
     p.add_argument("--light-dir", type=lambda t: tuple(float(x) for x in t.split(",")), default=(0.0, 0.3, -1.0),
                    help="direction the light travels (default: from above, slightly behind the robot, like the "
@@ -175,6 +188,12 @@ def main():
     p.add_argument("--no-ambient", action="store_true", help="disable ambient light")
     p.add_argument("--shadows", action="store_true",
                    help="cast shadows from the default light (the lab's diffuse ceiling light casts almost none)")
+    p.add_argument("--view", action="append", default=[], metavar="NAME:EX,EY,EZ:TX,TY,TZ:HFOV:WxH",
+                   help="extra fixed camera at eye E looking at T (world, metres; table top z=0), horizontal FOV "
+                        "in degrees, e.g. front_top:0,0.38,1.0:0,-0.3,0.15:70:1280x720 (repeatable); "
+                        "writes <trial_dir>/<NAME>.mp4")
+    p.add_argument("--no-robot-cams", dest="robot_cams", action="store_false",
+                   help="render only the --view cameras (leaves head / wrist videos untouched)")
     args = p.parse_args()
 
     import imageio.v2 as imageio
@@ -201,12 +220,19 @@ def main():
     cfg.enable_backface_culling = False  # single-layer cloth triangles must show both faces
     state = model.state()
 
+    # name: (robot body or fixed transform, width, height, hfov, near)
+    cams = {n: (c[0], c[1], c[2], c[3], NEAR[n]) for n, c in CAMERAS.items()} if args.robot_cams else {}
+    for v in args.view:
+        name, eye, target, hfov, res = v.split(":")
+        w, h = [int(x) for x in res.split("x")]
+        cams[name] = (look_at([float(x) for x in eye.split(",")], [float(x) for x in target.split(",")]),
+                      w, h, float(hfov), 0.05)
     outs = {}
-    for name, (_body, w, h, hfov, _conv, _near) in CAMERAS.items():
+    for name, (_body, w, h, hfov, near) in cams.items():
         f = w / (2 * math.tan(math.radians(hfov) / 2))
         rays = sensor.compute_camera_rays_pinhole_opencv(w, h, f, f, w / 2, h / 2, device=model.device)
         r = rays.numpy()
-        r[..., 0, :] = r[..., 1, :] * NEAR[name]  # origin = near-plane point along each ray
+        r[..., 0, :] = r[..., 1, :] * near  # origin = near-plane point along each ray
         rays.assign(r)
         img = sensor.allocate_image_color(1, w, h)
         writer = None if args.only_stills else imageio.get_writer(args.trial_dir / f"{name}.mp4", fps=fps,
@@ -221,9 +247,10 @@ def main():
         model.bvh_refit_shapes(state)
         model.bvh_refit_particles(state)
         body_q = state.body_q.numpy()
-        for name, (body, w, h, _hfov, _conv, _near) in CAMERAS.items():
+        for name, (body, w, h, _hfov, _near) in cams.items():
             rays, img, writer, stills = outs[name]
-            xf = wp.array([camera_transform(body_q[bodies[body]], name)], dtype=wp.transformf, device=model.device)
+            xf = body if not isinstance(body, str) else camera_transform(body_q[bodies[body]], name)
+            xf = wp.array([xf], dtype=wp.transformf, device=model.device)
             sensor.update(state, xf, rays, color_image=img)
             rgba = img.numpy()[0].view(np.uint8).reshape(h, w, 4)
             if writer is not None:
@@ -238,7 +265,7 @@ def main():
             writer.close()
         if stills:
             imageio.imwrite(args.trial_dir / f"{name}_stills.png", np.concatenate(stills, axis=1))
-    print(f"wrote {', '.join(f'{c}.mp4' for c in CAMERAS)} ({n} frames, {fps:.1f} fps) to {args.trial_dir}")
+    print(f"wrote {', '.join(f'{c}.mp4' for c in cams)} ({n} frames, {fps:.1f} fps) to {args.trial_dir}")
 
 
 if __name__ == "__main__":

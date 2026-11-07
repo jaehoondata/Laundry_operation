@@ -19,7 +19,7 @@ while [ "${1:-}" = "--stride" ] || [ "${1:-}" = "--robot-base-y" ]; do
 done
 export SG2_ROS_INSTALL=${SG2_ROS_INSTALL:-$HOME/Desktop/jaehoon/sg2_ros}
 source ~/anaconda3/etc/profile.d/conda.sh
-conda activate newton17
+conda activate "${NEWTON_ENV:-newton17}"   # vai_4090: ~/Desktop/jaehoon/envs/newton17
 python sim/isaac/export_scene.py "$trial" --stride "$stride" --robot-base-y "$base_y"
 fps=$(python -c "import numpy as np; print(float(np.load('$trial/scene.npz')['fps']))")
 bash sim/isaac/run_isaac.sh sim/isaac/render_isaac.py "/work/$trial/scene.npz" --out "/work/$trial/isaac" "$@" \

@@ -56,6 +56,11 @@ p.add_argument("--cloth-shell", type=float, default=0.0,
                help="render the cloth as a closed shell this thick [m] (two offset sides + rim) with smooth "
                     "normals, so each side shades correctly from its own side (0: the single-layer mesh)")
 p.add_argument("--renderer", default="RayTracedLighting", choices=["RayTracedLighting", "PathTracing"])
+p.add_argument("--view", action="append", default=[], metavar="NAME:EX,EY,EZ:TX,TY,TZ:HFOV:WxH",
+               help="extra fixed camera at eye E looking at T (world, metres; table top z=0), horizontal FOV in "
+                    "degrees, e.g. front_top:0,0.38,1.0:0,-0.3,0.15:70:1280x720 (repeatable)")
+p.add_argument("--no-robot-cams", dest="robot_cams", action="store_false",
+               help="render only the --view cameras, not the SG2 head / wrist cameras")
 args, _ = p.parse_known_args()
 
 t0 = time.time()
@@ -316,18 +321,41 @@ rect.CreateWidthAttr(args.rect_size)
 rect.CreateHeightAttr(args.rect_size)
 UsdGeom.XformCommonAPI(rect).SetTranslate(Gf.Vec3d(0.0, edge_y + 0.4, args.rect_height))  # faces -z by default
 
+def look_at(eye, target):
+    """4x4 camera pose (USD: looks along -z, +y up) at eye, aimed at target, world z up."""
+    eye, target = np.asarray(eye, float), np.asarray(target, float)
+    fwd = (target - eye) / np.linalg.norm(target - eye)
+    right = np.cross(fwd, [0.0, 0.0, 1.0])
+    right /= np.linalg.norm(right)
+    t = np.eye(4)
+    t[:3, 0], t[:3, 1], t[:3, 2], t[:3, 3] = right, np.cross(right, fwd), -fwd, eye
+    return t
+
+
 # cameras (USD: looks along -z, +y up; cam_T is already in that convention)
-cams, cam_ops, annots = [str(c) for c in d["cam_names"]], [], []
-for ci, c in enumerate(cams):
-    w, h = [int(v) for v in d["cam_res"][ci]]
+# each: (name, width, height, hfov, near, robot camera index or fixed 4x4 pose)
+specs = []
+if args.robot_cams:
+    for ci, c in enumerate(d["cam_names"]):
+        w, h = [int(v) for v in d["cam_res"][ci]]
+        specs.append((str(c), w, h, float(d["cam_hfov"][ci]), float(d["cam_near"][ci]), ci))
+for v in args.view:
+    name, eye, target, hfov, res = v.split(":")
+    w, h = [int(x) for x in res.split("x")]
+    specs.append((name, w, h, float(hfov), 0.05,
+                  look_at([float(x) for x in eye.split(",")], [float(x) for x in target.split(",")])))
+cams, cam_ops, annots = [s[0] for s in specs], [], []
+for c, w, h, hfov, near, pose in specs:
     cam = UsdGeom.Camera.Define(stage, f"/World/Cameras/{c}")
     f = 18.0
-    ha = 2 * f * math.tan(math.radians(float(d["cam_hfov"][ci])) / 2)
+    ha = 2 * f * math.tan(math.radians(hfov) / 2)
     cam.CreateFocalLengthAttr(f)
     cam.CreateHorizontalApertureAttr(ha)
     cam.CreateVerticalApertureAttr(ha * h / w)
-    cam.CreateClippingRangeAttr(Gf.Vec2f(float(d["cam_near"][ci]), 50.0))
+    cam.CreateClippingRangeAttr(Gf.Vec2f(near, 50.0))
     cam_ops.append(cam.AddTransformOp())
+    if not isinstance(pose, int):
+        set_matrix(cam_ops[-1], pose)
     rp = rep.create.render_product(f"/World/Cameras/{c}", (w, h))
     an = rep.AnnotatorRegistry.get_annotator("rgb")
     an.attach(rp)
@@ -342,8 +370,9 @@ t1 = time.time()
 for k, i in enumerate(todo):
     for li, op in enumerate(link_ops):
         set_matrix(op, d["link_T"][i, li])
-    for ci, op in enumerate(cam_ops):
-        set_matrix(op, d["cam_T"][i, ci])
+    for spec, op in zip(specs, cam_ops):
+        if isinstance(spec[5], int):
+            set_matrix(op, d["cam_T"][i, spec[5]])
     q = cloth_points(d["cloth_q"][i].astype(np.float64))
     cloth.GetPointsAttr().Set(Vt.Vec3fArray.FromNumpy(np.ascontiguousarray(q, dtype=np.float32)))
     if cloth_normals is not None:

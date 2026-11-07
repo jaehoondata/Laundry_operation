@@ -9,7 +9,7 @@ set -euo pipefail
 cd "$(dirname "$0")/../.."
 script=$1
 shift
-C=~/docker/isaac-sim
+C=${ISAAC_CACHE:-$HOME/docker/isaac-sim}   # override to keep the caches elsewhere (vai_4090: ~/Desktop/jaehoon/docker/isaac-sim)
 mkdir -p $C/cache/kit $C/cache/ov $C/cache/pip $C/cache/glcache $C/cache/computecache $C/logs $C/data outputs/isaac
 docker run --rm --gpus all --network=host \
     -e ACCEPT_EULA=Y -e PRIVACY_CONSENT=Y \
