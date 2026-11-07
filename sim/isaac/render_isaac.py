@@ -61,6 +61,9 @@ p.add_argument("--view", action="append", default=[], metavar="NAME:EX,EY,EZ:TX,
                     "degrees, e.g. front_top:0,0.38,1.0:0,-0.3,0.15:70:1280x720 (repeatable)")
 p.add_argument("--no-robot-cams", dest="robot_cams", action="store_false",
                help="render only the --view cameras, not the SG2 head / wrist cameras")
+p.add_argument("--no-wall", dest="wall", action="store_false",
+               help="no partition wall / windows across the table (for --view cameras placed beyond it); "
+                    "use --side-wall-x 0 to drop the side wall too")
 args, _ = p.parse_known_args()
 
 t0 = time.time()
@@ -224,7 +227,7 @@ def shell_setup(faces, nv):
     return np.concatenate([f, f[:, ::-1] + nv, rim])
 
 
-d = np.load(args.scene)
+d = dict(np.load(args.scene))  # load every array once: NpzFile decompresses the whole array on each d[key]
 stage = omni.usd.get_context().get_stage()
 UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
 UsdGeom.SetStageMetersPerUnit(stage, 1.0)
@@ -301,8 +304,9 @@ if args.table_texture != "none":
 # cameras see them; the head camera's view of the wall ends ~0.48 m up), a pale side wall on the right
 far = edge_y + depth + 0.01
 wb = args.window_bottom
-box(stage, "/World/Wall", (0.0, far, wb / 2 - thick / 2), (width + 2.0, 0.02, wb + thick), mats["wall"])
-if args.windows:
+if args.wall:
+    box(stage, "/World/Wall", (0.0, far, wb / 2 - thick / 2), (width + 2.0, 0.02, wb + thick), mats["wall"])
+if args.wall and args.windows:
     glass = emissive_material(stage, "/World/Looks/glass", Gf.Vec3f(0.85, 0.88, 0.92), args.window_glow)
     box(stage, "/World/Windows", (0.0, far + 0.02, wb + 0.6), (width + 2.0, 0.02, 1.2), glass)
     for k, x in enumerate(np.arange(-1.5, 1.51, args.mullion_spacing)):
