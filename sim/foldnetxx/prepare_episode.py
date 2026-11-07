@@ -36,13 +36,73 @@ sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parent / "sg2_newton"))
 sys.path.insert(0, str(HERE.parent / "sg2_reach"))
 from fit_initial_shirt import fit, load_mesh  # noqa: E402
-from t1_kinematics import REAL_MAX_SPEED, STEP_DT, active_mask, load_fold_segment, track_posture  # noqa: E402
+from t1_kinematics import FLAT, REAL_MAX_SPEED, STEP_DT, active_mask, load_fold_segment, track_posture  # noqa: E402
 
 
 def min_jerk_joints(q0, q1, n):
     s = np.linspace(0.0, 1.0, n + 1)[1:]
     w = 10 * s**3 - 15 * s**4 + 6 * s**5
     return q0[None] + w[:, None, None] * (q1 - q0)[None]
+
+
+def failure_keep_mask(episode, n, grip_closed):
+    """Steps of the fold segment to keep when FoldNet++'s injected failures and their recoveries are dropped.
+
+    A block is a run of steps with the same subtask. For a block with any is_correct_actions == False step:
+      * if the same subtask starts again within the next 6 blocks, with no other grasp subtask in between
+        (the usual "wrong grasp -> pull -> Re-grasp ... -> grasp again"), drop everything from the block
+        start up to that retry
+      * otherwise (corrected in place) drop only the incorrect steps
+    A cut is kept only if both grippers are in the same open/closed state right before and right after it.
+    Returns (keep [n] bool, list of (first, last, kind) dropped ranges in fold-segment steps)."""
+    import h5py
+
+    with h5py.File(episode, "r") as f:
+        sub = [s.decode() for s in f["subtasks"][:]]
+        ok = f["is_correct_actions"][:].astype(bool)
+    k0 = sub.index(FLAT)
+    sub, ok = sub[k0:k0 + n], ok[k0:k0 + n]
+    starts = [0] + [i for i in range(1, n) if sub[i] != sub[i - 1]]
+    ends = starts[1:] + [n]
+
+    def is_grasp(s):
+        s = s.lower()
+        return "grasp" in s and not s.startswith("re-grasp")
+
+    keep, cuts = np.ones(n, bool), []
+
+    def cut(a, b, kind):  # drop steps a..b-1
+        before = grip_closed[a - 1] if a > 0 else np.zeros(2, bool)
+        after = grip_closed[b] if b < n else before
+        if b > a and (before == after).all() and keep[a:b].all():
+            keep[a:b] = False
+            cuts.append((a, b - 1, kind))
+
+    for bi, (a, b) in enumerate(zip(starts, ends)):
+        if ok[a:b].all() or not keep[a:b].all():
+            continue
+        retry = None
+        for bj in range(bi + 1, min(bi + 7, len(starts))):
+            s = sub[starts[bj]]
+            if s == sub[a]:
+                retry = starts[bj]
+                break
+            if is_grasp(s):
+                break
+        if retry is not None:
+            cut(a, retry, "retry")
+        else:
+            i = a
+            while i < b:
+                if not ok[i]:
+                    j = i
+                    while j < b and not ok[j]:
+                        j += 1
+                    cut(i, j, "in-place")
+                    i = j
+                else:
+                    i += 1
+    return keep, cuts
 
 
 def main():
@@ -57,6 +117,9 @@ def main():
                    help="TCP height of the first grasps on the flat shirt. FoldNet++ episodes without the table offset "
                         "close at -0.012, but SG2's closed fingertips reach 0.8 cm below its TCP, so 0.008 puts them "
                         "on the table instead of 2 cm into it")
+    p.add_argument("--drop-failures", action="store_true",
+                   help="drop FoldNet++'s injected wrong actions and the recovery steps that undo them "
+                        "(see failure_keep_mask); the shirt fit still uses the original first grasps")
     args = p.parse_args()
 
     from sg2_ik import IDLE
@@ -65,6 +128,13 @@ def main():
 
     poses, grip_raw, sub = load_fold_segment(args.episode)
     n = len(sub)
+    cuts = []
+    if args.drop_failures:
+        keep, cuts = failure_keep_mask(args.episode, n, grip_raw > 0.5)
+        poses = {s: v[keep] for s, v in poses.items()}
+        grip_raw, sub = grip_raw[keep], [s for s, k in zip(sub, keep) if k]
+        print(f"dropped {n - len(sub)} of {n} fold steps: {cuts}")
+        n = len(sub)
     closed = grip_raw > 0.5
     first_z = sorted((k, poses[s][k, 2, 3]) for i, s in enumerate("lr")
                      for k in range(1, n) if closed[k, i] and not closed[k - 1, i])[:2]
@@ -95,7 +165,8 @@ def main():
                         grip=grip.astype(np.float32), dt=dt.astype(np.float32), subtask=np.array(subtask),
                         ik_ok=np.concatenate([np.ones((m, 2), bool), ok]), target=target, active=active)
     (args.out / "fit.json").write_text(json.dumps({**shirt, "episode": str(args.episode), "base_y": args.base_y,
-                                                   "height": args.height, "mesh_id": args.mesh_id, "z_shift": z_shift}, indent=1))
+                                                   "height": args.height, "mesh_id": args.mesh_id, "z_shift": z_shift,
+                                                   "dropped_failures": cuts}, indent=1))
     print(f"{args.episode.name}: {n} FoldNet++ steps + {m} approach, {dt.sum():.1f} s "
           f"(FoldNet++ {STEP_DT * (n - 1):.1f} s), IK ok {100 * ok.all(1).mean():.0f}%, "
           f"shirt size {shirt['size']:.3f} m, theta {shirt['theta_deg']:.1f} deg, z shift {100 * z_shift:+.1f} cm -> {args.out}")
