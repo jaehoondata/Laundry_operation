@@ -19,7 +19,7 @@ Grasp heights: in about a quarter of the episodes every grasp closes ~4.5 cm hig
 (first close z p50 ~ -0.01 m vs ~ +0.033 m, the same in all robots; likely a per-episode table height).
 Our table is at z = 0 and the picker only takes cloth from 1.3 cm below the TCP, so those grasps
 caught a single vertex. All EEF heights are shifted so that the first two closes (on the flat shirt)
-sit at --grasp-z (fit.json "z_shift").
+sit at --grasp-z (fit.json "z_shift"), where SG2's closed fingertips touch the table.
 
     python sim/foldnetxx/prepare_episode.py path/to/episode.h5 --out outputs/foldnetxx/t3/<name>
 """
@@ -53,8 +53,10 @@ def main():
     p.add_argument("--height", type=float, default=0.55)
     p.add_argument("--approach-s", type=float, default=3.0, help="idle pose -> first FoldNet++ pose")
     p.add_argument("--mesh-id", type=int, default=0)
-    p.add_argument("--grasp-z", type=float, default=-0.012,
-                   help="height of the first grasps on the flat shirt (FoldNet++ episodes with no table offset)")
+    p.add_argument("--grasp-z", type=float, default=0.008,
+                   help="TCP height of the first grasps on the flat shirt. FoldNet++ episodes without the table offset "
+                        "close at -0.012, but SG2's closed fingertips reach 0.8 cm below its TCP, so 0.008 puts them "
+                        "on the table instead of 2 cm into it")
     args = p.parse_args()
 
     from sg2_ik import IDLE

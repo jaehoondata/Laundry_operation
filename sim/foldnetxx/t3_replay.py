@@ -20,6 +20,15 @@ hand's previous release) and kept while the hand carries and until its next gras
 shape and timing stay FoldNet++'s. Step durations are stretched again where the re-solved joints
 would move faster than the real teleop maximum.
 
+--grip-model pinch (default) closes and opens the grippers over the real SG2 stroke time (1.0 s, measured
+on the teleop data) while the arms hold still, and grasps like fingers rather than a magnet box:
+  * at 70% of the close stroke (fingertips reach the cloth) it takes the cloth between the finger pads,
+    in the gripper's own frame (fingers close along its y axis): |y| <= --pinch-half-gap, |x| <=
+    --pinch-half-width, from 1.5 cm below the TCP up through every layer of the stack above it
+  * over the rest of the stroke those vertices are drawn in towards the pad line (y -> 15%, x -> 60%)
+  * on release the cloth is let go at 15% of the open stroke
+--grip-model box keeps the instant FoldNet++ picker-box grasp.
+
 Writes <plan_dir>/frames.npz in fold_test.py's format (q, faces, t, phase, pickers, joint, grip), so
 sim/sg2_newton/render_newton.py, sim/isaac/render_trial.sh and export_lerobot.py work on it.
 
@@ -171,6 +180,66 @@ class Retarget:
         return self.d.copy()
 
 
+STROKE_S = 1.0  # real SG2 gripper close / open time (teleop data, 10-90%: p50 1.0 s, p10-p90 0.97-1.17 s)
+CONTACT_FRAC, RELEASE_FRAC = 0.7, 0.15
+
+
+def pinch_select(sim, p, rot, args):
+    """Vertices between the finger pads of a gripper at TCP p with rotation rot (columns = gripper axes)."""
+    x = sim.q()
+    d = (x - p) @ rot
+    flat = (np.abs(d[:, 1]) <= args.pinch_half_gap) & (np.abs(d[:, 0]) <= args.pinch_half_width)
+    low = x[:, 2] >= p[2] - 0.015
+    sel = np.flatnonzero(flat & low)
+    if not len(sel):
+        near = np.linalg.norm(x[:, :2] - p[:2], axis=1)
+        j = int(near.argmin())
+        sel = np.array([j]) if near[j] < 0.015 and x[j, 2] >= p[2] - 0.015 else np.zeros(0, int)
+    return sel, x[sel] - p
+
+
+def actuate(sim, k, tcp, rots, closing, opening, args):
+    """Hold the arms at step k while the closing hands' grippers close and the opening hands' open over
+    STROKE_S; pinch at CONTACT_FRAC of the stroke and draw the pinched cloth in, let go at RELEASE_FRAC."""
+    n = max(1, int(round(STROKE_S / args.sim_dt)))
+    sim.cur_targets = tcp[k].copy()
+    sim.targets.assign(sim.cur_targets)
+    sim.target_vel.zero_()
+    start = sim.cur_grip.copy()
+    end = start.copy()
+    end[list(closing)] = 1.0
+    end[list(opening)] = 0.0
+    contact, release = int(CONTACT_FRAC * n), int(RELEASE_FRAC * n)
+    base = {}  # hand -> (vertex ids, offsets in the gripper frame)
+    counts = {}
+    every = max(1, n // 40)
+    for st in range(n):
+        f = (st + 1) / n
+        if st == release:
+            for h in opening:
+                release_hand(sim, h)
+        if st == contact:
+            for h in closing:
+                sel, off = pinch_select(sim, tcp[k, h], rots[h], args)
+                base[h] = (sel, off @ rots[h])
+                counts[h] = len(sel)
+        if base and st >= contact and (st - contact) % every == 0:
+            g = (st - contact + 1) / max(1, n - contact)
+            idx0, off0, own0 = current_pins(sim)
+            keep = ~np.isin(own0, list(base))
+            idx, off, own = [idx0[keep]], [off0[keep]], [own0[keep]]
+            for h, (sel, local) in base.items():
+                if not len(sel):
+                    continue
+                loc = local * np.array([1 - 0.4 * g, 1 - 0.85 * g, 1.0])
+                idx.append(sel); off.append(loc @ rots[h].T); own.append(np.full(len(sel), h))
+            rebuild_pins(sim, np.concatenate(idx), np.concatenate(off), np.concatenate(own))
+        sim.cur_grip = start + (end - start) * f
+        sim.substep()
+    sim.cur_grip = end
+    return counts
+
+
 def main():
     p = make_parser(__doc__)
     p.add_argument("plan_dir", type=Path)
@@ -184,6 +253,9 @@ def main():
                    help="keypoint: move each grasp onto the simulated shirt and re-solve the IK online")
     p.add_argument("--edge-margin", type=float, default=0.015, help="retarget: grasp at least this far inside the cloth outline")
     p.add_argument("--footprint-cell", type=float, default=0.005)
+    p.add_argument("--grip-model", choices=("pinch", "box"), default="pinch")
+    p.add_argument("--pinch-half-gap", type=float, default=0.03, help="pinch: cloth this far either side of the pad line (finger closing axis)")
+    p.add_argument("--pinch-half-width", type=float, default=0.015, help="pinch: half the finger pad width")
     p.set_defaults(record_dt=1.0 / 30.0, table_mu=0.5, ground_mu=0.5)
     args = p.parse_args()
 
@@ -205,14 +277,18 @@ def main():
     q, tcp, grip, dt, sub = (plan[k].astype(float) if k != "subtask" else plan[k] for k in ("q", "tcp", "grip", "dt", "subtask"))
     q, tcp, dt = q.copy(), tcp.copy(), dt.copy()
     rt = None
-    if args.retarget != "none":
-        sys.path.insert(0, str(HERE.parent / "sg2_newton"))
-        sys.path.insert(0, str(HERE.parent / "sg2_reach"))
-        from posture_prior import PRIOR_PATH
-        from sg2_robot import SG2Arms
-        from t1_kinematics import REAL_MAX_SPEED, STEP_DT
+    sys.path.insert(0, str(HERE.parent / "sg2_newton"))
+    sys.path.insert(0, str(HERE.parent / "sg2_reach"))
+    from posture_prior import PRIOR_PATH
+    from sg2_robot import SG2Arms
+    from t1_kinematics import REAL_MAX_SPEED, STEP_DT
 
-        arms = SG2Arms(base_y=fit["base_y"], height=fit["height"], prior=PRIOR_PATH, start_idle=True)
+    arms = SG2Arms(base_y=fit["base_y"], height=fit["height"], prior=PRIOR_PATH, start_idle=True)
+
+    def grip_rot(k):
+        return [arms.iks[s].chain.fk(q[k, h], arms.base)[0][:3, :3] for h, s in enumerate("lr")]
+
+    if args.retarget != "none":
         park = {s: arms.park(s) for s in "lr"}
         rt = Retarget(sim, faces, keypoints, plan, args)
 
@@ -239,16 +315,27 @@ def main():
             resolve(k)  # the planned first FoldNet++ pose may already move a little
         if rt is not None and k + 1 > first:
             resolve(k + 1)
-        for h in range(2):
-            was = grip[k - 1, h] if k else 0.0
-            if grip[k, h] > 0.5 and was <= 0.5:
+        closing = [h for h in range(2) if grip[k, h] > 0.5 and (grip[k - 1, h] if k else 0.0) <= 0.5]
+        opening = [h for h in range(2) if grip[k, h] <= 0.5 and (grip[k - 1, h] if k else 0.0) > 0.5]
+        if args.grip_model == "pinch":
+            if closing or opening:
+                t0 = float(sim.t)
+                sim.phase = str(sub[k])
+                counts = actuate(sim, k, tcp, grip_rot(k), closing, opening, args)
+                events += [(t0, str(sub[k]), "lr"[h], "grasp", counts.get(h, 0)) for h in closing]
+                events += [(t0, str(sub[k]), "lr"[h], "release", 0) for h in opening]
+        else:
+            for h in closing:
                 events.append((float(sim.t), str(sub[k]), "lr"[h], "grasp", grasp_hand(sim, h, tcp[k])))
-            elif grip[k, h] <= 0.5 and was > 0.5:
+            for h in opening:
                 release_hand(sim, h)
                 events.append((float(sim.t), str(sub[k]), "lr"[h], "release", 0))
-        sim.cur_grip = grip[k]
+            sim.cur_grip = grip[k]
         n_dt = max(1, int(round(float(dt[k]) / args.sim_dt)))
         sim.follow(tcp[k:k + 2], str(sub[k]), step_dt=n_dt * args.sim_dt, joints=q[k:k + 2])
+    still = [h for h in range(2) if sim.cur_grip[h] > 0.5]
+    if args.grip_model == "pinch" and still:
+        actuate(sim, len(q) - 1, tcp, grip_rot(len(q) - 1), [], still, args)
     for h in range(2):
         release_hand(sim, h)
     sim.cur_grip = np.zeros(2)
@@ -262,7 +349,8 @@ def main():
     summary = {"sim_s": sim.t, "flat_area": flat_area, "final_area": final_area,
                "final_footprint": final_area / max(flat_area, 1e-9),
                "pinned_per_grasp": [e[4] for e in events if e[3] == "grasp"], "events": events,
-               "retarget": args.retarget, "retarget_log": rt.log if rt else [], "duration_s": float(dt.sum())}
+               "retarget": args.retarget, "retarget_log": rt.log if rt else [], "duration_s": float(dt.sum()),
+               "grip_model": args.grip_model}
     (args.plan_dir / "replay.json").write_text(json.dumps(summary, indent=1))
     print(f"{args.plan_dir.name}: {sim.t:.1f} s sim, final footprint {summary['final_footprint']:.2f} of flat, "
           f"vertices per grasp {summary['pinned_per_grasp']}")
